@@ -4,6 +4,61 @@ import { useState, useEffect, useCallback } from 'react'
 import { ChatSession, Message } from '@/types/chat'
 import { StorageService } from '@/lib/storage-service'
 
+interface SaveHistoryOptions {
+  threadId?: string | null
+}
+
+function buildSessionFingerprint(session: ChatSession): string {
+  const messages = StorageService.getSessionMessages<Message>(session.id) || []
+  const normalized = messages
+    .map(m => `${m.role}:${String(m.content || '').trim()}`)
+    .filter(Boolean)
+    .slice(0, 6)
+    .join('|')
+
+  return [
+    session.threadId || '',
+    String(session.title || '').trim(),
+    normalized
+  ].join('::')
+}
+
+function normalizeHistory(sessions: ChatSession[]): ChatSession[] {
+  const byThreadId = new Map<string, ChatSession>()
+  const byFingerprint = new Map<string, ChatSession>()
+
+  for (const rawSession of sessions) {
+    const session: ChatSession = {
+      ...rawSession,
+      createdAt: rawSession.createdAt || Date.now(),
+      updatedAt: rawSession.updatedAt || Date.now(),
+      isPinned: rawSession.isPinned || false,
+      tags: rawSession.tags || []
+    }
+
+    const threadId = (session.threadId || '').trim()
+    if (threadId) {
+      const existing = byThreadId.get(threadId)
+      if (!existing || existing.updatedAt < session.updatedAt) {
+        byThreadId.set(threadId, session)
+      }
+      continue
+    }
+
+    const fingerprint = buildSessionFingerprint(session)
+    const existing = byFingerprint.get(fingerprint)
+    if (!existing || existing.updatedAt < session.updatedAt) {
+      byFingerprint.set(fingerprint, session)
+    }
+  }
+
+  return [...byThreadId.values(), ...byFingerprint.values()].sort((a, b) => {
+    if (a.isPinned && !b.isPinned) return -1
+    if (!a.isPinned && b.isPinned) return 1
+    return b.updatedAt - a.updatedAt
+  })
+}
+
 export function useChatHistory() {
   const [history, setHistory] = useState<ChatSession[]>([])
   const [isHistoryLoading, setIsHistoryLoading] = useState(true)
@@ -13,23 +68,7 @@ export function useChatHistory() {
     const loadHistory = () => {
       try {
         const savedHistory = StorageService.getHistory<ChatSession>()
-        // Migrate legacy data if necessary
-        const migratedHistory = savedHistory.map(session => ({
-          ...session,
-          createdAt: session.createdAt || Date.now(),
-          updatedAt: session.updatedAt || Date.now(),
-          isPinned: session.isPinned || false,
-          tags: session.tags || []
-        }))
-        
-        // Sort: Pinned first, then by updatedAt desc
-        const sorted = migratedHistory.sort((a, b) => {
-          if (a.isPinned && !b.isPinned) return -1
-          if (!a.isPinned && b.isPinned) return 1
-          return b.updatedAt - a.updatedAt
-        })
-
-        setHistory(sorted)
+        setHistory(normalizeHistory(savedHistory))
       } catch (e) {
         console.error('Failed to load history', e)
       } finally {
@@ -49,14 +88,19 @@ export function useChatHistory() {
 
   const refreshHistory = useCallback(() => {
     const saved = StorageService.getHistory<ChatSession>()
-    setHistory(saved)
+    setHistory(normalizeHistory(saved))
   }, [])
 
-  const saveToHistory = useCallback((messages: Message[], currentSessionId?: string) => {
+  const saveToHistory = useCallback((
+    messages: Message[],
+    currentSessionId?: string,
+    options?: SaveHistoryOptions
+  ) => {
     if (messages.length === 0) return null
 
     const timestamp = Date.now()
     let sessionId = currentSessionId
+    const nextThreadId = options?.threadId || undefined
 
     setHistory(prev => {
       const existingIndex = sessionId ? prev.findIndex(s => s.id === sessionId) : -1
@@ -67,6 +111,7 @@ export function useChatHistory() {
         updatedHistory[existingIndex] = {
           ...updatedHistory[existingIndex],
           updatedAt: timestamp,
+          threadId: nextThreadId ?? updatedHistory[existingIndex].threadId,
           // Update title if it's still the default "New Conversation" or generic
           // (Logic can be refined, here we just update timestamp primarily)
         }
@@ -88,10 +133,11 @@ export function useChatHistory() {
           date: new Date(timestamp).toLocaleDateString(), // Keep legacy for display fallback
           createdAt: timestamp,
           updatedAt: timestamp,
+          threadId: nextThreadId,
           isPinned: false,
           tags: []
         }
-        return [newSession, ...prev]
+        return normalizeHistory([newSession, ...prev])
       }
     })
 
@@ -107,17 +153,17 @@ export function useChatHistory() {
     return StorageService.getSessionMessages(id)
   }, [])
 
-  const deleteSession = (id: string) => {
+  const deleteSession = useCallback((id: string) => {
     setHistory(prev => prev.filter(s => s.id !== id))
     StorageService.removeSessionMessages(id)
-  }
+  }, [])
 
-  const clearHistory = () => {
+  const clearHistory = useCallback(() => {
     StorageService.clearAll()
     setHistory([])
-  }
+  }, [])
 
-  const togglePin = (id: string) => {
+  const togglePin = useCallback((id: string) => {
     setHistory(prev => {
       const mapped = prev.map(s => s.id === id ? { ...s, isPinned: !s.isPinned } : s)
       return mapped.sort((a, b) => {
@@ -126,15 +172,28 @@ export function useChatHistory() {
           return b.updatedAt - a.updatedAt
       })
     })
-  }
+  }, [])
 
-  const renameSession = (id: string, newTitle: string) => {
+  const renameSession = useCallback((id: string, newTitle: string) => {
     setHistory(prev => prev.map(s => s.id === id ? { ...s, title: newTitle } : s))
-  }
+  }, [])
 
-  const updateTags = (id: string, tags: string[]) => {
+  const setSessionThreadId = useCallback((id: string, threadId: string | null) => {
+    if (!id || !threadId) return
+    setHistory(prev => {
+      let changed = false
+      const next = prev.map(s => {
+        if (s.id !== id || s.threadId === threadId) return s
+        changed = true
+        return { ...s, threadId }
+      })
+      return changed ? next : prev
+    })
+  }, [])
+
+  const updateTags = useCallback((id: string, tags: string[]) => {
     setHistory(prev => prev.map(s => s.id === id ? { ...s, tags } : s))
-  }
+  }, [])
 
   return {
     history,
@@ -145,6 +204,7 @@ export function useChatHistory() {
     clearHistory,
     togglePin,
     renameSession,
+    setSessionThreadId,
     updateTags,
     refreshHistory
   }

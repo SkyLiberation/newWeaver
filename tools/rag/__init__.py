@@ -10,6 +10,7 @@ Provides functionality for:
 
 from tools.rag.document_loader import Document, DocumentLoader
 from tools.rag.embedder import Embedder
+from tools.rag.manager import RAGManager
 from tools.rag.rag_tool import RAGTool, rag_search
 from tools.rag.vector_store import VectorStore
 
@@ -17,6 +18,7 @@ __all__ = [
     "DocumentLoader",
     "Document",
     "Embedder",
+    "RAGManager",
     "VectorStore",
     "RAGTool",
     "rag_search",

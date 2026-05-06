@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import hashlib
 import hmac
 import json
 import logging
@@ -87,6 +86,7 @@ from tools.io.asr import get_asr_service, init_asr_service
 from tools.io.screenshot_service import get_screenshot_service
 from tools.io.tts import AVAILABLE_VOICES, get_tts_service, init_tts_service
 from tools.mcp import close_mcp_tools, init_mcp_tools, reload_mcp_tools
+from tools.rag import RAGManager
 from tools.sandbox import sandbox_browser_sessions
 from tools.search.multi_search import get_search_orchestrator
 from triggers import (
@@ -103,6 +103,12 @@ from triggers import (
 # Initialize logging
 setup_logging()
 logger = get_logger(__name__)
+
+
+def _rag_chat_model_factory(model: str, temperature: float = 0.2) -> Any:
+    from agent.workflows.nodes import _chat_model
+
+    return _chat_model(model, temperature=temperature)
 
 
 @asynccontextmanager
@@ -740,6 +746,8 @@ def _coerce_search_mode_input(value: Any) -> SearchMode | None:
             return SearchMode(mode="auto")
         if lowered == "direct":
             return SearchMode(mode="direct")
+        if lowered in {"rag", "kb", "knowledge", "knowledge_base", "database"}:
+            return SearchMode(mode="rag")
         if lowered in {"web", "search", "tavily"}:
             return SearchMode(mode="web", useWebSearch=True)
         if lowered in {"mcp"}:
@@ -771,7 +779,7 @@ def _coerce_search_mode_input(value: Any) -> SearchMode | None:
         if use_deep and not use_agent:
             use_deep = False
 
-        if mode not in {"auto", "direct", "web", "agent", "deep"}:
+        if mode not in {"auto", "direct", "rag", "web", "agent", "deep"}:
             if use_deep:
                 mode = "deep"
             elif use_agent:
@@ -890,6 +898,7 @@ class PublicConfigDefaults(BaseModel):
 
 class PublicConfigFeatures(BaseModel):
     mcp_enabled: bool
+    rag_enabled: bool
     sandbox_mode: str
     prometheus_enabled: bool
     tracing_enabled: bool
@@ -973,6 +982,7 @@ class ChatRequest(BaseModel):
     search_mode: Optional[SearchMode] = None
     agent_id: Optional[str] = None  # optional GPTs-like agent profile id (data/agents.json)
     user_id: Optional[str] = None
+    thread_id: Optional[str] = None
     images: Optional[List[ImagePayload]] = None  # Base64 images for multimodal input
 
     @field_validator("search_mode", mode="before")
@@ -1679,7 +1689,7 @@ def _normalize_search_mode(search_mode: SearchMode | Dict[str, Any] | str | None
         use_deep = False
         use_deep_prompt = False
 
-    if requested_mode not in {"auto", "direct", "web", "agent", "deep"}:
+    if requested_mode not in {"auto", "direct", "rag", "web", "agent", "deep"}:
         if use_deep:
             requested_mode = "deep"
         elif use_agent:
@@ -1696,6 +1706,49 @@ def _normalize_search_mode(search_mode: SearchMode | Dict[str, Any] | str | None
         "mode": requested_mode,
         "use_deep_prompt": use_deep_prompt,
     }
+
+
+async def _run_rag_search(request: Request, query: str, n_results: int = 5) -> List[Dict[str, Any]]:
+    return await rag_manager.run_search(request, query, n_results=n_results)
+
+
+def _format_rag_context(results: List[Dict[str, Any]]) -> str:
+    return rag_manager.format_context(results)
+
+
+async def _answer_with_rag(
+    *,
+    request: Request,
+    query: str,
+    model: str,
+    persona_instruction: str = "",
+    n_results: int = 5,
+) -> Dict[str, Any]:
+    return await rag_manager.answer(
+        request=request,
+        query=query,
+        model=model,
+        persona_instruction=persona_instruction,
+        n_results=n_results,
+    )
+
+
+async def stream_rag_events(
+    *,
+    request: Request,
+    query: str,
+    thread_id: str,
+    model: str,
+    persona_instruction: str = "",
+) -> Any:
+    async for event in rag_manager.stream_events(
+        request=request,
+        query=query,
+        thread_id=thread_id,
+        model=model,
+        persona_instruction=persona_instruction,
+    ):
+        yield event
 
 
 def _normalize_images_payload(images: Optional[List[ImagePayload]]) -> List[Dict[str, Any]]:
@@ -1735,6 +1788,84 @@ def _store_search(query: str, user_id: str, limit: int = 3) -> List[str]:
     except Exception as e:
         logger.debug(f"Store search failed: {e}")
         return []
+
+
+_PERSONA_PATTERNS = (
+    re.compile(r"^\s*你现在是(?P<persona>.+)$", re.IGNORECASE),
+    re.compile(r"^\s*从现在开始你是(?P<persona>.+)$", re.IGNORECASE),
+    re.compile(r"^\s*你是我的(?P<persona>.+)$", re.IGNORECASE),
+    re.compile(r"^\s*you are now (?P<persona>.+)$", re.IGNORECASE),
+    re.compile(r"^\s*from now on you are (?P<persona>.+)$", re.IGNORECASE),
+    re.compile(r"^\s*act as (?P<persona>.+)$", re.IGNORECASE),
+)
+
+
+def _extract_persona_instruction(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    normalized = re.sub(r"\s+", " ", raw)
+    for pattern in _PERSONA_PATTERNS:
+        match = pattern.match(normalized)
+        if match:
+            persona = str(match.group("persona") or "").strip(" 。.!?;；，,")
+            if persona:
+                return raw
+    return ""
+
+
+def _load_persona_instruction(user_id: str) -> str:
+    if not store:
+        return ""
+    namespace = (user_id, "persona")
+    try:
+        item = store.get(namespace, "active")
+        value = getattr(item, "value", None) if item is not None else None
+        if isinstance(value, dict):
+            instruction = value.get("instruction") or value.get("content") or ""
+            return str(instruction).strip()
+        if isinstance(value, str):
+            return value.strip()
+    except Exception as e:
+        logger.debug(f"Persona load failed: {e}")
+    return ""
+
+
+def _save_persona_instruction(text: str, user_id: str) -> str:
+    instruction = _extract_persona_instruction(text)
+    if not instruction or not store:
+        return ""
+    namespace = (user_id, "persona")
+    try:
+        store.put(namespace, "active", {"instruction": instruction}, index=False)
+        return instruction
+    except Exception as e:
+        logger.debug(f"Persona save failed: {e}")
+        return ""
+
+
+def _build_persona_system_instruction(instruction: str) -> str:
+    cleaned = str(instruction or "").strip()
+    if not cleaned:
+        return ""
+    return (
+        "Persistent user role instruction:\n"
+        "The user has explicitly assigned you the following role/persona. "
+        "Treat it as a high-priority behavioral instruction for future replies unless "
+        "it conflicts with safety or an explicit newer user override.\n"
+        f"- {cleaned}"
+    )
+
+
+rag_manager = RAGManager(
+    settings=settings,
+    metrics_registry=metrics_registry,
+    format_stream_event=format_stream_event,
+    chat_model_factory=_rag_chat_model_factory,
+    persona_instruction_builder=_build_persona_system_instruction,
+    contains_cjk=_contains_cjk,
+)
 
 
 def _store_add(query: str, content: str, user_id: str):
@@ -1819,6 +1950,8 @@ async def stream_agent_events(
     model = (model or settings.primary_model).strip()
     agent_id = (agent_id or "default").strip() or "default"
     agent_profile = get_agent_profile(agent_id) or get_agent_profile("default")
+    latest_persona = _save_persona_instruction(input_text, user_id)
+    persona_instruction = latest_persona or _load_persona_instruction(user_id)
 
     # Optional per-thread log handler for easier debugging
     thread_handler = None
@@ -1905,6 +2038,10 @@ async def stream_agent_events(
             messages.append(SystemMessage(content=agent_profile.system_prompt))
         if mode_info.get("use_deep_prompt"):
             messages.append(SystemMessage(content=get_deep_agent_prompt()))
+        if persona_instruction:
+            messages.append(
+                SystemMessage(content=_build_persona_system_instruction(persona_instruction))
+            )
 
         store_memories = _store_search(input_text, user_id=user_id)
         if store_memories:
@@ -2374,8 +2511,15 @@ async def chat_sse(request: Request, payload: ChatRequest):
     user_id = principal_id if internal_key and principal_id else (payload.user_id or settings.memory_user_id)
     mode_info = _normalize_search_mode(payload.search_mode)
     model = (payload.model or settings.primary_model).strip()
-    thread_id = f"thread_{uuid.uuid4().hex}"
-    set_thread_owner(thread_id, getattr(request.state, "principal_id", "") or "anonymous")
+    latest_persona = _save_persona_instruction(last_message, user_id)
+    persona_instruction = latest_persona or _load_persona_instruction(user_id)
+    requested_thread_id = (payload.thread_id or "").strip()
+    if requested_thread_id:
+        _require_thread_owner(request, requested_thread_id)
+        thread_id = requested_thread_id
+    else:
+        thread_id = f"thread_{uuid.uuid4().hex}"
+        set_thread_owner(thread_id, getattr(request.state, "principal_id", "") or "anonymous")
 
     async def _sse_generator():
         gauge = None
@@ -2397,7 +2541,7 @@ async def chat_sse(request: Request, payload: ChatRequest):
 
             # Deterministic failure mode when no API key is configured.
             # We keep this fast and side-effect free (no graph compilation/run).
-            if not (settings.openai_api_key or "").strip():
+            if mode_info.get("mode") != "rag" and not (settings.openai_api_key or "").strip():
                 seq += 1
                 yield format_sse_event(
                     event="error",
@@ -2408,18 +2552,30 @@ async def chat_sse(request: Request, payload: ChatRequest):
                 yield format_sse_event(event="done", data={"thread_id": thread_id}, event_id=seq)
                 return
 
-            source = iter_with_sse_keepalive(
-                stream_agent_events(
-                    last_message,
-                    thread_id=thread_id,
-                    model=model,
-                    search_mode=mode_info,
-                    agent_id=payload.agent_id,
-                    images=_normalize_images_payload(payload.images),
-                    user_id=user_id,
-                ),
-                interval_s=15.0,
-            )
+            if mode_info.get("mode") == "rag":
+                source = iter_with_sse_keepalive(
+                    stream_rag_events(
+                        request=request,
+                        query=last_message,
+                        thread_id=thread_id,
+                        model=model,
+                        persona_instruction=persona_instruction,
+                    ),
+                    interval_s=15.0,
+                )
+            else:
+                source = iter_with_sse_keepalive(
+                    stream_agent_events(
+                        last_message,
+                        thread_id=thread_id,
+                        model=model,
+                        search_mode=mode_info,
+                        agent_id=payload.agent_id,
+                        images=_normalize_images_payload(payload.images),
+                        user_id=user_id,
+                    ),
+                    interval_s=15.0,
+                )
 
             async for maybe_line in iter_abort_on_disconnect(
                 source,
@@ -2486,11 +2642,36 @@ async def chat(request: Request, payload: ChatRequest):
         logger.info(f"  Stream: {payload.stream}")
         logger.info(f"  Message length: {len(last_message)} chars")
         logger.debug(f"  Message preview: {last_message[:200]}...")
+        latest_persona = _save_persona_instruction(last_message, user_id)
+        persona_instruction = latest_persona or _load_persona_instruction(user_id)
 
+        requested_thread_id = (payload.thread_id or "").strip()
         if payload.stream:
-            thread_id = f"thread_{uuid.uuid4().hex}"
+            if requested_thread_id:
+                _require_thread_owner(request, requested_thread_id)
+                thread_id = requested_thread_id
+            else:
+                thread_id = f"thread_{uuid.uuid4().hex}"
             logger.info(f"Starting streaming response | Thread: {thread_id}")
             set_thread_owner(thread_id, principal_id or "anonymous")
+
+            if mode_info.get("mode") == "rag":
+                return StreamingResponse(
+                    stream_rag_events(
+                        request=request,
+                        query=last_message,
+                        thread_id=thread_id,
+                        model=model,
+                        persona_instruction=persona_instruction,
+                    ),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                        "X-Thread-ID": thread_id,
+                    },
+                )
 
             # Return streaming response with thread_id in header for cancellation
             return StreamingResponse(
@@ -2512,6 +2693,27 @@ async def chat(request: Request, payload: ChatRequest):
                 },
             )
         else:
+            if mode_info.get("mode") == "rag":
+                if requested_thread_id:
+                    _require_thread_owner(request, requested_thread_id)
+                    thread_id = requested_thread_id
+                else:
+                    thread_id = thread_id or f"thread_{uuid.uuid4().hex}"
+
+                rag_result = await _answer_with_rag(
+                    request=request,
+                    query=last_message,
+                    model=model,
+                    persona_instruction=persona_instruction,
+                )
+                final_report = str(rag_result.get("content") or "")
+                _store_add(last_message, final_report, user_id=user_id)
+                return ChatResponse(
+                    id=f"msg_{datetime.now().timestamp()}",
+                    content=final_report,
+                    timestamp=datetime.now().isoformat(),
+                )
+
             # Non-streaming response (fallback)
             initial_state: AgentState = {
                 "input": last_message,
@@ -2541,6 +2743,10 @@ async def chat(request: Request, payload: ChatRequest):
                 messages.append(SystemMessage(content=agent_profile.system_prompt))
             if mode_info.get("use_deep_prompt"):
                 messages.append(SystemMessage(content=get_deep_agent_prompt()))
+            if persona_instruction:
+                messages.append(
+                    SystemMessage(content=_build_persona_system_instruction(persona_instruction))
+                )
 
             store_memories = _store_search(last_message, user_id=user_id)
             if store_memories:
@@ -2571,7 +2777,11 @@ async def chat(request: Request, payload: ChatRequest):
                 },
                 "recursion_limit": 50,
             }
-            thread_id = thread_id or f"thread_{uuid.uuid4().hex}"
+            if requested_thread_id:
+                _require_thread_owner(request, requested_thread_id)
+                thread_id = requested_thread_id
+            else:
+                thread_id = thread_id or f"thread_{uuid.uuid4().hex}"
             metrics = metrics_registry.start(
                 thread_id, model=model, route=mode_info.get("mode", "auto")
             )
@@ -3202,6 +3412,7 @@ async def public_config():
         },
         "features": {
             "mcp_enabled": bool(mcp_enabled),
+            "rag_enabled": bool(settings.rag_enabled),
             "sandbox_mode": settings.sandbox_mode,
             "prometheus_enabled": bool(settings.enable_prometheus),
             "tracing_enabled": bool(settings.enable_tracing),
@@ -3581,21 +3792,7 @@ async def export_report_endpoint(
 
 
 def _rag_collection_for_request(request: Request) -> str:
-    """
-    Resolve the Chroma collection name for RAG documents.
-
-    Hybrid behavior:
-    - Default/dev (internal auth disabled): single shared collection
-    - Enterprise internal (internal auth enabled): per-principal isolated collection
-    """
-    base = (getattr(settings, "rag_collection_name", "") or "weaver_documents").strip() or "weaver_documents"
-    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
-    if not internal_key:
-        return base
-
-    principal_id = (getattr(request.state, "principal_id", "") or "").strip() or "internal"
-    suffix = hashlib.sha256(principal_id.encode("utf-8")).hexdigest()[:12]
-    return f"{base}__u_{suffix}"
+    return rag_manager.collection_for_request(request)
 
 
 @app.post("/api/documents/upload")
@@ -3605,46 +3802,7 @@ async def upload_document(request: Request, file: UploadFile = File(...)):
 
     Supports PDF, DOCX, TXT, MD files.
     """
-    if not settings.rag_enabled:
-        raise HTTPException(status_code=400, detail="RAG is not enabled. Set rag_enabled=True in settings.")
-
-    # Validate file size (max 50MB)
-    MAX_FILE_SIZE = 50 * 1024 * 1024
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.")
-
-    # Validate file extension
-    ALLOWED_EXTENSIONS = {"pdf", "docx", "doc", "txt", "md", "csv"}
-    filename = file.filename or ""
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail=f"Unsupported file type '.{ext}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}")
-
-    try:
-        from tools.rag.rag_tool import get_rag_tool
-
-        rag = get_rag_tool(collection_name=_rag_collection_for_request(request))
-        if rag is None:
-            raise HTTPException(status_code=500, detail="Failed to initialize RAG tool")
-
-        result = rag.add_document(content=content, filename=file.filename)
-
-        if not result.get("success"):
-            raise HTTPException(status_code=400, detail=result.get("error", "Upload failed"))
-
-        return {
-            "success": True,
-            "filename": file.filename,
-            "chunks": result.get("chunks", 0),
-            "message": f"Document '{file.filename}' uploaded successfully with {result.get('chunks', 0)} chunks",
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Document upload error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return await rag_manager.upload_document(request, file)
 
 
 @app.get("/api/documents/list")
@@ -3652,27 +3810,7 @@ async def list_documents(request: Request, limit: int = 100):
     """
     List all documents in the RAG knowledge base.
     """
-    if not settings.rag_enabled:
-        raise HTTPException(status_code=400, detail="RAG is not enabled.")
-
-    try:
-        from tools.rag.rag_tool import get_rag_tool
-
-        rag = get_rag_tool(collection_name=_rag_collection_for_request(request))
-        if rag is None:
-            raise HTTPException(status_code=500, detail="Failed to initialize RAG tool")
-
-        documents = rag.list_documents(limit=limit)
-        count = rag.count()
-
-        return {
-            "total_chunks": count,
-            "documents": documents,
-        }
-
-    except Exception as e:
-        logger.error(f"List documents error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return await rag_manager.list_documents(request, limit=limit)
 
 
 @app.delete("/api/documents/{source:path}")
@@ -3680,27 +3818,7 @@ async def delete_document(source: str, request: Request):
     """
     Delete a document from the RAG knowledge base by source path.
     """
-    if not settings.rag_enabled:
-        raise HTTPException(status_code=400, detail="RAG is not enabled.")
-
-    try:
-        from tools.rag.rag_tool import get_rag_tool
-
-        rag = get_rag_tool(collection_name=_rag_collection_for_request(request))
-        if rag is None:
-            raise HTTPException(status_code=500, detail="Failed to initialize RAG tool")
-
-        result = rag.delete_document(source)
-        if not result.get("success"):
-            raise HTTPException(status_code=400, detail=result.get("error", "Delete failed"))
-
-        return {"success": True, "message": f"Document '{source}' deleted"}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Delete document error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return await rag_manager.delete_document(request, source)
 
 
 @app.post("/api/documents/search")
@@ -3708,26 +3826,7 @@ async def search_documents(request: Request, query: str, n_results: int = 5):
     """
     Search the RAG knowledge base.
     """
-    if not settings.rag_enabled:
-        raise HTTPException(status_code=400, detail="RAG is not enabled.")
-
-    try:
-        from tools.rag.rag_tool import get_rag_tool
-
-        rag = get_rag_tool(collection_name=_rag_collection_for_request(request))
-        if rag is None:
-            raise HTTPException(status_code=500, detail="Failed to initialize RAG tool")
-
-        results = rag.search(query, n_results=n_results)
-
-        return {
-            "query": query,
-            "results": results,
-        }
-
-    except Exception as e:
-        logger.error(f"Search documents error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return await rag_manager.search_documents(request, query, n_results=n_results)
 
 
 # ==================== Sessions API ====================

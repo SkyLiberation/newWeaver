@@ -48,14 +48,15 @@ class Embedder:
 
         from common.config import settings
 
-        self.model = model
+        self.model = model or getattr(settings, "embedding_model", "") or "text-embedding-3-small"
         self.dimensions = dimensions
 
         client_kwargs = {
-            "api_key": api_key or settings.openai_api_key,
+            "api_key": api_key or getattr(settings, "embedding_api_key", "") or settings.openai_api_key,
         }
-        if base_url or settings.openai_base_url:
-            client_kwargs["base_url"] = base_url or settings.openai_base_url
+        resolved_base_url = base_url or getattr(settings, "embedding_base_url", "") or settings.openai_base_url
+        if resolved_base_url:
+            client_kwargs["base_url"] = resolved_base_url
 
         self.client = OpenAI(**client_kwargs)
 

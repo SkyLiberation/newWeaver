@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import { createFilePreview } from '@/lib/file-utils'
 import { getApiBaseUrl } from '@/lib/api'
+import { fetchPublicConfig } from '@/lib/publicConfig'
 
 interface ChatInputProps {
   input: string
@@ -47,6 +48,18 @@ export function ChatInput({
   const [isDragging, setIsDragging] = useState(false)
   const [selectedMcp, setSelectedMcp] = useState('filesystem') // Default MCP
   const [previews, setPreviews] = useState<AttachmentPreview[]>([])
+  const [ragEnabled, setRagEnabled] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    fetchPublicConfig().then((cfg) => {
+      if (cancelled) return
+      setRagEnabled(Boolean(cfg?.features?.rag_enabled))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   // Manage Previews
   useEffect(() => {
@@ -279,7 +292,7 @@ export function ChatInput({
 
   const handleCommandSelect = (cmd: string) => {
       if (cmd === 'direct') setSearchMode('')
-      else if (['agent','ultra','web','deep','deep_agent'].includes(cmd)) setSearchMode(cmd)
+      else if (['agent','ultra','web','deep','deep_agent','rag'].includes(cmd)) setSearchMode(cmd)
       if (cmd === 'clear') window.location.reload()
 
       if (cmd === 'fix') setInput('Please fix the following code:\n\n')
@@ -314,12 +327,16 @@ export function ChatInput({
     { id: 'web', label: t('web'), icon: Globe, color: "text-blue-500", bg: "bg-blue-500/10", border: "border-blue-500/20" },
     { id: 'agent', label: t('agent'), icon: Bot, color: "text-purple-500", bg: "bg-purple-500/10", border: "border-purple-500/20" },
     { id: 'ultra', label: t('ultra'), icon: Rocket, color: "text-indigo-500", bg: "bg-indigo-500/10", border: "border-indigo-500/20" },
+    ...(ragEnabled ? [
+      { id: 'rag', label: '数据库', icon: BookOpen, color: "text-emerald-500", bg: "bg-emerald-500/10", border: "border-emerald-500/20" }
+    ] : []),
   ]
 
   const commands = [
       { id: 'agent', label: 'Agent Mode', icon: Bot, desc: 'Plan & web search' },
       { id: 'ultra', label: 'Deep Research', icon: Rocket, desc: 'Deep research (agent + deep search)' },
       { id: 'web', label: 'Web Mode', icon: Globe, desc: 'Web search only' },
+      ...(ragEnabled ? [{ id: 'rag', label: 'RAG Mode', icon: BookOpen, desc: 'Answer from uploaded documents' }] : []),
       { id: 'fix', label: 'Fix Code', icon: Bug, desc: 'Debug & Fix' },
       { id: 'explain', label: 'Explain', icon: BookOpen, desc: 'Explain concept' },
       { id: 'refactor', label: 'Refactor', icon: PenTool, desc: 'Optimize code' },

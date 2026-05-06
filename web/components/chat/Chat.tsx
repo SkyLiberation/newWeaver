@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useRef, useEffect, useState } from 'react'
+import React, { useRef, useEffect, useState, useCallback } from 'react'
 import { Virtuoso, VirtuosoHandle } from 'react-virtuoso'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { MessageItem } from './MessageItem'
@@ -17,6 +17,7 @@ import { STORAGE_KEYS, DEFAULT_MODEL } from '@/lib/constants'
 import { useChatHistory } from '@/hooks/useChatHistory'
 import { useChatStream } from '@/hooks/useChatStream'
 import { filesToImageAttachments } from '@/lib/file-utils'
+import { getApiBaseUrl } from '@/lib/api'
 import { Discover } from '@/components/views/Discover'
 import { Library } from '@/components/views/Library'
 import { SettingsDialog } from '@/components/settings/SettingsDialog'
@@ -54,7 +55,8 @@ export function Chat() {
     deleteSession, 
     clearHistory,
     togglePin,
-    renameSession
+    renameSession,
+    setSessionThreadId,
   } = useChatHistory()
   
   const {
@@ -110,54 +112,152 @@ export function Chat() {
   // Auto-save messages when they update during streaming or after approval
   useEffect(() => {
     if (messages.length > 0 && currentSessionId && !isLoading) {
-      saveToHistory(messages, currentSessionId)
+      saveToHistory(messages, currentSessionId, { threadId })
     }
-  }, [messages, currentSessionId, isLoading, saveToHistory])
+  }, [messages, currentSessionId, isLoading, saveToHistory, threadId])
 
   useEffect(() => {
-    const sessionId = searchParams.get('session')
-    if (!sessionId || sessionId === currentSessionId) return
+    if (currentSessionId && threadId) {
+      setSessionThreadId(currentSessionId, threadId)
+    }
+  }, [currentSessionId, threadId, setSessionThreadId])
 
-    const loadedMessages = loadSession(sessionId)
-    if (!loadedMessages) return
+  const mapBackendMessageType = useCallback((type: string): Message['role'] => {
+    const normalized = String(type || '').toLowerCase()
+    if (normalized.includes('human') || normalized === 'user') return 'user'
+    if (normalized.includes('system')) return 'system'
+    return 'assistant'
+  }, [])
 
-    if (messages.length > 0) {
-      saveToHistory(messages, currentSessionId || undefined)
+  const fetchSessionMessagesFromBackend = useCallback(async (sessionThreadId: string) => {
+    const res = await fetch(`${getApiBaseUrl()}/api/sessions/${sessionThreadId}/state`)
+    if (!res.ok) {
+      throw new Error(`Failed to load session state: ${res.status}`)
     }
 
-    setMessages(loadedMessages)
+    const data = await res.json()
+    const rawMessages = Array.isArray(data?.state?.messages) ? data.state.messages : []
+    return rawMessages
+      .map((msg: any, index: number) => {
+        const content = typeof msg?.content === 'string' ? msg.content : ''
+        if (!content.trim()) return null
+
+        return {
+          id: `restored-${sessionThreadId}-${index}`,
+          role: mapBackendMessageType(msg?.type),
+          content,
+        } as Message
+      })
+      .filter(Boolean) as Message[]
+  }, [mapBackendMessageType])
+
+  const sanitizeRestoredMessages = useCallback((items: Message[]) => {
+    const filtered = items.filter(message => {
+      if (message.role === 'system') return false
+      const content = String(message.content || '').trim()
+      if (!content) return false
+      if (content.startsWith('Stored memories:')) return false
+      if (content.startsWith('Relevant past knowledge:')) return false
+      return true
+    })
+
+    return filtered.filter((message, index) => {
+      const prev = filtered[index - 1]
+      if (!prev) return true
+      return !(prev.role === message.role && prev.content === message.content)
+    })
+  }, [])
+
+  const restoreSession = useCallback(async (sessionId: string) => {
+    const session = history.find(item => item.id === sessionId)
+    const localMessages = sanitizeRestoredMessages(loadSession(sessionId) || [])
+    let restoredMessages = localMessages
+    const restoredThreadId = session?.threadId || null
+
+    if (restoredThreadId && localMessages.length === 0) {
+      try {
+        const backendMessages = sanitizeRestoredMessages(
+          await fetchSessionMessagesFromBackend(restoredThreadId)
+        )
+        if (backendMessages.length > 0) {
+          restoredMessages = backendMessages
+          saveToHistory(backendMessages, sessionId, { threadId: restoredThreadId })
+        }
+      } catch (error) {
+        console.error('Failed to restore session from backend checkpoint', error)
+      }
+    }
+
+    setMessages(restoredMessages)
     setCurrentSessionId(sessionId)
     setCurrentView('dashboard')
     setArtifacts([])
     setCurrentStatus('')
     setInput('')
-    setThreadId(null)
+    setThreadId(restoredThreadId)
     setPendingInterrupt(null)
-    handleStop()
   }, [
-    searchParams,
-    currentSessionId,
+    history,
     loadSession,
-    messages,
     saveToHistory,
-    setMessages,
     setArtifacts,
     setCurrentStatus,
-    setThreadId,
+    setMessages,
     setPendingInterrupt,
-    handleStop,
+    setThreadId,
+    fetchSessionMessagesFromBackend,
+    sanitizeRestoredMessages,
   ])
+
+  const restoreSessionRef = useRef(restoreSession)
+  restoreSessionRef.current = restoreSession
+  const currentSessionIdRef = useRef(currentSessionId)
+  currentSessionIdRef.current = currentSessionId
+  const messagesRef = useRef(messages)
+  messagesRef.current = messages
+  const threadIdRef = useRef(threadId)
+  threadIdRef.current = threadId
+  const restoringSessionRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    const sessionId = searchParams.get('session')
+    if (
+      !sessionId ||
+      sessionId === currentSessionIdRef.current ||
+      sessionId === restoringSessionRef.current
+    ) {
+      return
+    }
+
+    restoringSessionRef.current = sessionId
+
+    void (async () => {
+      try {
+        if (messagesRef.current.length > 0) {
+          saveToHistory(messagesRef.current, currentSessionIdRef.current || undefined, {
+            threadId: threadIdRef.current
+          })
+        }
+
+        await handleStop()
+        await restoreSessionRef.current(sessionId)
+      } finally {
+        restoringSessionRef.current = null
+      }
+    })()
+  }, [searchParams, saveToHistory, handleStop])
 
   // Auto-scroll logic handled by Virtuoso's followOutput, 
   // but we can add specific triggers if needed.
 
   const handleNewChat = () => {
       if (messages.length > 0) {
-        saveToHistory(messages, currentSessionId || undefined)
+        saveToHistory(messages, currentSessionId || undefined, { threadId })
       }
       
       setCurrentView('dashboard') // Switch back to chat view
       setCurrentSessionId(null)
+      restoringSessionRef.current = null
       router.replace('/')
       
       // Reset state
@@ -186,24 +286,11 @@ export function Chat() {
   const handleChatSelect = (id: string) => {
     // Save current chat if not empty
     if (messages.length > 0) {
-        saveToHistory(messages, currentSessionId || undefined)
+        saveToHistory(messages, currentSessionId || undefined, { threadId })
     }
-    
-    // Load new session
-    const loadedMessages = loadSession(id)
-    if (loadedMessages) {
-      setMessages(loadedMessages)
-      setCurrentSessionId(id)
-      setCurrentView('dashboard') // Ensure we are on the chat view
-      router.replace(`/?session=${id}`)
-      // Reset other state
-      setArtifacts([]) 
-      setCurrentStatus('')
-      setInput('')
-      setThreadId(null)
-      setPendingInterrupt(null)
-      handleStop()
-    }
+
+    setCurrentView('dashboard')
+    router.replace(`/?session=${id}`)
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -227,13 +314,13 @@ export function Chat() {
     // Auto-save logic: if it's the first message, it will trigger saveToHistory later
     // or we can call it here to get an ID.
     if (!currentSessionId && newHistory.length === 1) {
-        const id = saveToHistory(newHistory)
+        const id = saveToHistory(newHistory, undefined, { threadId })
         if (id) setCurrentSessionId(id)
     } else if (currentSessionId) {
-        saveToHistory(newHistory, currentSessionId)
+        saveToHistory(newHistory, currentSessionId, { threadId })
     }
 
-    await processChat(newHistory, imagePayloads)
+    await processChat(newHistory, imagePayloads, threadId)
   }
 
   const handleEditMessage = async (id: string, newContent: string) => {
@@ -250,7 +337,7 @@ export function Chat() {
       setMessages(newHistory)
 
       if (updatedMessage.role === 'user') {
-          await processChat(newHistory, updatedMessage.attachments)
+          await processChat(newHistory, updatedMessage.attachments, threadId)
       }
   }
 

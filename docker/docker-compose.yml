@@ -12,6 +12,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U manus"]
       interval: 10s
@@ -38,12 +39,38 @@ services:
     networks:
       - weaver-net
 
+  # ---------- Qdrant (Vector DB for RAG) ----------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: weaver_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - weaver-net
+
+  # ---------- Chroma (Vector DB for RAG) ----------
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: weaver_chroma
+    restart: unless-stopped
+    ports:
+      - "8002:8000"
+    volumes:
+      - chroma_data:/data
+    networks:
+      - weaver-net
+
   # ---------- Backend (FastAPI) ----------
   backend:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     container_name: weaver_backend
+    user: "0:0"
     restart: unless-stopped
     ports:
       - "8001:8000"
@@ -51,6 +78,8 @@ services:
       - ../.env
     environment:
       APP_ENV: prod
+      RAG_ENABLED: "true"
+      RAG_QDRANT_URL: http://qdrant:6333
       DATABASE_URL: postgresql://manus:manus_dev_password@postgres:5432/manus_db
       MEMORY_STORE_BACKEND: postgres
       MEMORY_STORE_URL: postgresql://manus:manus_dev_password@postgres:5432/manus_db
@@ -59,6 +88,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -68,13 +99,38 @@ services:
     volumes:
       - ..:/app
       - ../web:/app/web
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: /opt/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - weaver-net
+
+  # ---------- VectorAdmin (Vector DB Management GUI) ----------
+  vectoradmin:
+    image: mintplexlabs/vectoradmin:latest
+    container_name: weaver_vectoradmin
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    volumes:
+      - vectoradmin_data:/app/data
+    environment:
+      SERVER_PORT: "3001"
+      JWT_SECRET: "weaver-vectoradmin-jwt-073f4ac8d1e6"
+      INNGEST_EVENT_KEY: "background_workers"
+      INNGEST_SIGNING_KEY: "weaver-inngest-signing-9b2e5f1c"
+      INNGEST_LANDING_PAGE: "true"
+      DATABASE_CONNECTION_STRING: "postgresql://manus:manus_dev_password@postgres:5432/vectoradmin"
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - weaver-net
 
 volumes:
   postgres_data:
   redis_data:
+  qdrant_data:
+  chroma_data:
+  vectoradmin_data:
 
 networks:
   weaver-net:

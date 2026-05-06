@@ -1816,22 +1816,14 @@ You can also use XML format for tool calls:
 </function_calls>"""
             enhanced_system_prompt += xml_instruction
 
-        # Build messages list with enhanced system prompt
-        messages: List[Any] = []
+        # Build messages list with the base agent prompt first, then any seeded context.
+        # This keeps Weaver's core operating instructions even when memory/persona/system
+        # messages are injected upstream.
+        messages: List[Any] = [SystemMessage(content=enhanced_system_prompt)]
 
-        # Check if there's already a system message in seeded messages
         seeded = state.get("messages") or []
-        has_system_msg = False
         if isinstance(seeded, list):
-            for msg in seeded:
-                if isinstance(msg, SystemMessage):
-                    has_system_msg = True
-                    break
             messages.extend(seeded)
-
-        # Add enhanced system prompt if no system message exists
-        if not has_system_msg:
-            messages.insert(0, SystemMessage(content=enhanced_system_prompt))
 
         if browser_hint:
             messages.append(SystemMessage(content=browser_hint))

@@ -41,7 +41,11 @@ export function useChatStream({ selectedModel, searchMode }: UseChatStreamProps)
     setTimeout(() => setCurrentStatus(''), 3000)
   }, [threadId])
 
-  const processChat = useCallback(async (messageHistory: Message[], images?: ImageAttachment[]) => {
+  const processChat = useCallback(async (
+    messageHistory: Message[],
+    images?: ImageAttachment[],
+    resumeThreadId?: string | null
+  ) => {
     setIsLoading(true)
     abortControllerRef.current = new AbortController()
 
@@ -58,6 +62,7 @@ export function useChatStream({ selectedModel, searchMode }: UseChatStreamProps)
             stream: true,
             model: selectedModel,
             search_mode: searchMode,
+            thread_id: resumeThreadId || undefined,
             images: (images || []).map(img => ({
               name: img.name,
               mime: img.mime,

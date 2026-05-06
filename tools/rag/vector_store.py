@@ -5,9 +5,9 @@ Stores and retrieves document embeddings using ChromaDB.
 """
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from tools.rag.document_loader import Document
 
@@ -38,6 +38,8 @@ class VectorStore:
         collection_name: str = "weaver_documents",
         persist_directory: Optional[str] = None,
         embedding_function: Optional[Any] = None,
+        http_endpoint: Optional[str] = None,
+        http_headers: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize the vector store.
@@ -46,6 +48,8 @@ class VectorStore:
             collection_name: Name of the ChromaDB collection
             persist_directory: Directory for persistent storage (None for in-memory)
             embedding_function: Optional custom embedding function
+            http_endpoint: Optional Chroma HTTP endpoint
+            http_headers: Optional headers for Chroma HTTP auth
         """
         if not CHROMADB_AVAILABLE:
             raise ImportError(
@@ -55,9 +59,22 @@ class VectorStore:
 
         self.collection_name = collection_name
         self.persist_directory = persist_directory
+        self.http_endpoint = (http_endpoint or "").strip()
 
         # Initialize ChromaDB client
-        if persist_directory:
+        if self.http_endpoint:
+            parsed = urlparse(self.http_endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError(f"Invalid Chroma HTTP endpoint: {self.http_endpoint}")
+
+            self.client = chromadb.HttpClient(
+                host=parsed.hostname,
+                port=parsed.port or (443 if parsed.scheme == "https" else 80),
+                ssl=parsed.scheme == "https",
+                headers=http_headers or None,
+                settings=Settings(anonymized_telemetry=False),
+            )
+        elif persist_directory:
             Path(persist_directory).mkdir(parents=True, exist_ok=True)
             self.client = chromadb.PersistentClient(
                 path=persist_directory,
@@ -75,7 +92,10 @@ class VectorStore:
         )
 
         self.embedding_function = embedding_function
-        logger.info(f"Initialized vector store: {collection_name}")
+        if self.http_endpoint:
+            logger.info(f"Initialized vector store via Chroma HTTP: {collection_name} @ {self.http_endpoint}")
+        else:
+            logger.info(f"Initialized vector store: {collection_name}")
 
     def add_documents(
         self,

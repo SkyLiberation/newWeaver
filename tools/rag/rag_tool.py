@@ -33,6 +33,8 @@ class RAGTool:
         embedding_model: str = "text-embedding-3-small",
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
+        http_endpoint: Optional[str] = None,
+        http_headers: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize the RAG tool.
@@ -43,6 +45,8 @@ class RAGTool:
             embedding_model: OpenAI embedding model name
             chunk_size: Document chunk size
             chunk_overlap: Chunk overlap for context
+            http_endpoint: Optional Chroma HTTP endpoint
+            http_headers: Optional headers for Chroma HTTP auth
         """
         self.loader = DocumentLoader(
             chunk_size=chunk_size,
@@ -52,6 +56,8 @@ class RAGTool:
         self.vector_store = VectorStore(
             collection_name=collection_name,
             persist_directory=persist_directory,
+            http_endpoint=http_endpoint,
+            http_headers=http_headers,
             embedding_function=self.embedder,
         )
 
@@ -200,12 +206,19 @@ def get_rag_tool(*, collection_name: Optional[str] = None) -> Optional[RAGTool]:
         if existing is not None:
             return existing
 
+        chroma_header = (getattr(settings, "rag_chroma_api_header", "") or "").strip()
+        chroma_key = (getattr(settings, "rag_chroma_api_key", "") or "").strip()
         rag = RAGTool(
             collection_name=resolved_collection,
             persist_directory=getattr(settings, "rag_store_path", None),
-            embedding_model=getattr(settings, "rag_embedding_model", "text-embedding-3-small"),
+            embedding_model=(
+                getattr(settings, "embedding_model", "")
+                or getattr(settings, "rag_embedding_model", "text-embedding-3-small")
+            ),
             chunk_size=getattr(settings, "rag_chunk_size", 1000),
             chunk_overlap=getattr(settings, "rag_chunk_overlap", 200),
+            http_endpoint=getattr(settings, "rag_chroma_endpoint", None),
+            http_headers={chroma_header: chroma_key} if chroma_header and chroma_key else None,
         )
         _RAG_BY_COLLECTION[resolved_collection] = rag
         return rag

@@ -2,12 +2,14 @@
 
 import React, { useState, useRef, useEffect } from 'react'
 import { Button } from '@/components/ui/button'
-import { PanelLeft, Sun, Moon, ChevronDown, Check, LayoutPanelLeft, Settings } from 'lucide-react'
+import { PanelLeft, Sun, Moon, ChevronDown, Check, LayoutPanelLeft, Settings, BookOpen } from 'lucide-react'
 import { useTheme } from '@/components/theme-provider'
 import { useI18n } from '@/lib/i18n/i18n-context'
 import { SettingsDialog } from '@/components/settings/SettingsDialog'
 import { cn } from '@/lib/utils'
 import { usePublicModels } from '@/hooks/usePublicModels'
+import { fetchPublicConfig } from '@/lib/publicConfig'
+import { KnowledgeBaseDialog } from '@/components/rag/KnowledgeBaseDialog'
 
 interface HeaderProps {
   sidebarOpen: boolean
@@ -24,6 +26,8 @@ export function Header({ sidebarOpen, onToggleSidebar, selectedModel, onModelCha
   const { models: publicModels } = usePublicModels()
   const [isModelOpen, setIsModelOpen] = useState(false)
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
+  const [isKnowledgeBaseOpen, setIsKnowledgeBaseOpen] = useState(false)
+  const [ragEnabled, setRagEnabled] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
 
   const toggleTheme = () => {
@@ -40,6 +44,17 @@ export function Header({ sidebarOpen, onToggleSidebar, selectedModel, onModelCha
     }
     document.addEventListener("mousedown", handleClickOutside)
     return () => document.removeEventListener("mousedown", handleClickOutside)
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchPublicConfig().then((cfg) => {
+      if (cancelled) return
+      setRagEnabled(Boolean(cfg?.features?.rag_enabled))
+    })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   const staticModels = [
@@ -120,6 +135,18 @@ export function Header({ sidebarOpen, onToggleSidebar, selectedModel, onModelCha
              </Button>
          )}
 
+         {ragEnabled && (
+           <Button
+             variant="ghost"
+             size="sm"
+             onClick={() => setIsKnowledgeBaseOpen(true)}
+             className="gap-2 rounded-full hover:bg-muted/50"
+           >
+             <BookOpen className="h-4 w-4 text-emerald-500" />
+             知识库
+           </Button>
+         )}
+
                   {/* Custom Model Dropdown - Refreshed */}
                   <div className="relative" ref={dropdownRef}>
                      <button
@@ -178,6 +205,10 @@ export function Header({ sidebarOpen, onToggleSidebar, selectedModel, onModelCha
         onOpenChange={setIsSettingsOpen}
         selectedModel={selectedModel}
         onModelChange={onModelChange}
+      />
+      <KnowledgeBaseDialog
+        open={isKnowledgeBaseOpen}
+        onOpenChange={setIsKnowledgeBaseOpen}
       />
     </header>
   )

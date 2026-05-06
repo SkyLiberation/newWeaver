@@ -12,7 +12,14 @@ export interface PublicConfigResponse {
     primary_model: string
     reasoning_model: string
   }
-  features: Record<string, any>
+  features: {
+    mcp_enabled?: boolean
+    rag_enabled?: boolean
+    sandbox_mode?: string
+    prometheus_enabled?: boolean
+    tracing_enabled?: boolean
+    [key: string]: any
+  }
   streaming: Record<string, any>
   models?: PublicConfigModels
 }

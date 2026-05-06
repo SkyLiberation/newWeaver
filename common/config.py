@@ -166,6 +166,9 @@ class Settings(BaseSettings):
     # API Keys
     openai_api_key: str = ""
     openai_base_url: str = ""
+    embedding_api_key: str = ""
+    embedding_base_url: str = ""
+    embedding_model: str = ""
     use_azure: bool = False
     azure_api_key: str = ""
     azure_endpoint: str = ""
@@ -289,7 +292,10 @@ class Settings(BaseSettings):
     rag_enabled: bool = False  # Enable local document RAG
     rag_store_path: Optional[str] = None  # Path for persistent vector storage
     rag_collection_name: str = "weaver_documents"  # ChromaDB collection name
-    rag_embedding_model: str = "text-embedding-3-small"  # OpenAI embedding model
+    rag_chroma_endpoint: str = ""  # Optional Chroma HTTP endpoint, e.g. http://chroma:8000
+    rag_chroma_api_header: str = ""  # Optional auth header name for Chroma HTTP
+    rag_chroma_api_key: str = ""  # Optional auth header value for Chroma HTTP
+    rag_embedding_model: str = "text-embedding-3-small"  # Legacy embedding model fallback
     rag_chunk_size: int = 1000  # Document chunk size
     rag_chunk_overlap: int = 200  # Overlap between chunks
 

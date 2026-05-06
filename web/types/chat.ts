@@ -59,6 +59,7 @@ export interface ChatSession {
   date: string // Legacy field, kept for compatibility
   updatedAt: number
   createdAt: number
+  threadId?: string
   tags?: string[]
   isPinned?: boolean
   summary?: string
