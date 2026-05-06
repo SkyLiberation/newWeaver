@@ -1062,10 +1062,9 @@ def route_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Route execution using SmartRouter (LLM-based intelligent routing).
 
-    Priority:
+    Flow:
     1. Config override (search_mode.mode) - for explicit user control
-    2. SmartRouter LLM decision - intelligent query classification
-    3. Low confidence fallback - route to clarify if confidence < threshold
+    2. SmartRouter LLM decision - classify clear requests into execution modes
 
     Returns state updates with routing decision and metadata.
     """
@@ -1073,9 +1072,9 @@ def route_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
 
     configurable = _configurable(config)
     mode_info = configurable.get("search_mode", {}) or {}
-    override_mode = mode_info.get("mode")
+    requested_mode = str(mode_info.get("mode") or "").strip().lower()
+    override_mode = requested_mode if requested_mode in {"direct", "web", "agent", "deep"} else None
     max_revisions = configurable.get("max_revisions", state.get("max_revisions", 0))
-    confidence_threshold = float(configurable.get("routing_confidence_threshold", 0.6))
 
     # Use SmartRouter (handles override internally)
     result = smart_route(
@@ -1088,17 +1087,9 @@ def route_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     route = result.get("route", "direct")
     confidence = result.get("routing_confidence", 1.0)
 
-    # Low confidence fallback: route to clarify
-    if not override_mode and confidence < confidence_threshold:
-        logger.info(
-            f"Low confidence ({confidence:.2f} < {confidence_threshold}), routing to clarify"
-        )
-        route = "clarify"
-        result["route"] = "clarify"
-        result["needs_clarification"] = True
-
     logger.info(f"[route_node] Routing decision: {route} (confidence: {confidence:.2f})")
     logger.info(f"[route_node] search_mode from config: {mode_info}")
+    logger.info(f"[route_node] requested_mode: {requested_mode}")
     logger.info(f"[route_node] override_mode: {override_mode}")
     logger.info(f"[route_node] Returning result with route='{route}'")
 
@@ -1137,6 +1128,18 @@ def clarify_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     Uses structured output with retry for robustness.
     """
     logger.info("Executing clarify node")
+
+    existing_question = str(state.get("clarification_question") or "").strip()
+    if state.get("needs_clarification") and existing_question:
+        logger.info("Clarification already determined upstream; returning stored question.")
+        return {
+            "needs_clarification": True,
+            "clarification_question": existing_question,
+            "final_report": existing_question,
+            "messages": [AIMessage(content=existing_question)],
+            "is_complete": True,
+        }
+
     llm = _chat_model(_model_for_task("routing", config), temperature=0.3)
 
     class ClarifyResponse(BaseModel):
@@ -1178,6 +1181,7 @@ def clarify_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
         logger.info("Clarification required; returning question to user.")
         return {
             "needs_clarification": True,
+            "clarification_question": question,
             "final_report": question,
             "messages": [AIMessage(content=question)],
             "is_complete": True,
@@ -1436,11 +1440,22 @@ def hitl_draft_review_node(state: AgentState, config: RunnableConfig) -> Dict[st
     Optional HITL checkpoint: review/edit the draft report before evaluation/finalization.
     """
     if not _hitl_checkpoint_active(config, "draft"):
+        configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+        allow_interrupts = bool(configurable.get("allow_interrupts"))
+        enabled = sorted(_hitl_checkpoints_enabled())
+        logger.info(
+            "[hitl_draft_review] skipped: allow_interrupts=%s enabled_checkpoints=%s",
+            allow_interrupts,
+            enabled,
+        )
         return {}
 
     draft = state.get("draft_report") or state.get("final_report", "")
     if not isinstance(draft, str) or not draft.strip():
+        logger.info("[hitl_draft_review] skipped: empty draft")
         return {}
+
+    logger.info("[hitl_draft_review] interrupting for draft review")
 
     prompt = {
         "checkpoint": "draft",

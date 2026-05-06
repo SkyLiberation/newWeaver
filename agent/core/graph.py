@@ -1,9 +1,11 @@
 import logging
+import asyncio
 from pathlib import Path
 
 import psycopg
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, StateGraph
+from psycopg.rows import dict_row
 
 from agent.workflows.nodes import (
     agent_node,
@@ -30,6 +32,37 @@ from agent.workflows.nodes import (
 from .state import AgentState, QueryState
 
 logger = logging.getLogger(__name__)
+
+
+class CompatiblePostgresSaver(PostgresSaver):
+    """
+    Sync PostgresSaver with async wrappers for LangGraph async execution paths.
+
+    The app currently mixes sync checkpoint access (session APIs) with async graph
+    execution (`astream_events` / `ainvoke`). LangGraph's sync PostgresSaver does
+    not implement async methods, so we delegate them to the sync implementation in
+    a worker thread.
+    """
+
+    async def aget_tuple(self, config):
+        return await asyncio.to_thread(self.get_tuple, config)
+
+    async def alist(self, config, *, filter=None, before=None, limit=None):
+        items = await asyncio.to_thread(
+            lambda: list(self.list(config, filter=filter, before=before, limit=limit))
+        )
+        for item in items:
+            yield item
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        return await asyncio.to_thread(
+            self.put, config, checkpoint, metadata, new_versions
+        )
+
+    async def aput_writes(self, config, writes, task_id, task_path=""):
+        return await asyncio.to_thread(
+            self.put_writes, config, writes, task_id, task_path
+        )
 
 
 def create_research_graph(checkpointer=None, interrupt_before=None, store=None):
@@ -77,11 +110,15 @@ def create_research_graph(checkpointer=None, interrupt_before=None, store=None):
         workflow.add_node("coordinator", coordinator_node)
 
     # Set entry point
-    workflow.set_entry_point("router")
+    workflow.set_entry_point("clarify")
 
     def route_decision(state: AgentState) -> str:
         route = state.get("route", "direct")
         logger.info(f"[route_decision] state['route'] = '{route}'")
+
+        if state.get("needs_clarification"):
+            logger.info("[route_decision] -> Routing to 'human_review' due to clarification request")
+            return "human_review"
 
         if route == "deep":
             if use_hierarchical:
@@ -100,9 +137,9 @@ def create_research_graph(checkpointer=None, interrupt_before=None, store=None):
             return "direct_answer"
 
         logger.info("[route_decision] → Routing to 'clarify' node (default)")
-        return "clarify"
+        return "direct_answer"
 
-    route_targets = ["direct_answer", "agent", "web_plan", "clarify", "deepsearch"]
+    route_targets = ["direct_answer", "agent", "web_plan", "deepsearch", "human_review"]
     if use_hierarchical:
         route_targets.append("coordinator")
 
@@ -131,11 +168,11 @@ def create_research_graph(checkpointer=None, interrupt_before=None, store=None):
         )
 
     def after_clarify(state: AgentState) -> str:
-        return "human_review" if state.get("needs_clarification") else "planner"
+        return "human_review" if state.get("needs_clarification") else "router"
 
-    workflow.add_conditional_edges("clarify", after_clarify, ["planner", "human_review"])
+    workflow.add_conditional_edges("clarify", after_clarify, ["router", "human_review"])
 
-    # Planning path (agent + deep)
+    # Planning path (regular research / coordinator)
     workflow.add_edge("planner", "hitl_plan_review")
     workflow.add_edge("refine_plan", "hitl_plan_review")
 
@@ -223,8 +260,9 @@ def create_research_graph(checkpointer=None, interrupt_before=None, store=None):
     workflow.add_edge("direct_answer", "human_review")
     workflow.add_edge("agent", "human_review")
 
-    # Final edge
-    workflow.add_edge("deepsearch", "human_review")
+    # Deepsearch is a specialized deep-mode executor; reuse the common
+    # draft-review/evaluation tail instead of bypassing quality control.
+    workflow.add_edge("deepsearch", "hitl_draft_review")
     workflow.add_edge("human_review", END)
 
     # HITL checkpoints are implemented via explicit review nodes that use
@@ -268,12 +306,17 @@ def create_checkpointer(database_url: str):
 
     # Create connection (psycopg3)
     try:
-        conn = psycopg.connect(database_url)
+        conn = psycopg.connect(
+            database_url,
+            autocommit=True,
+            prepare_threshold=0,
+            row_factory=dict_row,
+        )
     except Exception as e:
         raise RuntimeError(f"Failed to connect to Postgres for checkpointer: {e}") from e
 
     # Create checkpointer
-    checkpointer = PostgresSaver(conn)
+    checkpointer = CompatiblePostgresSaver(conn)
 
     # Setup tables
     checkpointer.setup()

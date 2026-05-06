@@ -47,13 +47,13 @@ services:
     restart: unless-stopped
     ports:
       - "8001:8000"
+    env_file:
+      - ../.env
     environment:
+      APP_ENV: prod
       DATABASE_URL: postgresql://manus:manus_dev_password@postgres:5432/manus_db
-      MEMORY_STORE_BACKEND: redis
-      MEMORY_STORE_URL: redis://redis:6379/0
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      TAVILY_API_KEY: ${TAVILY_API_KEY}
-      E2B_API_KEY: ${E2B_API_KEY}
+      MEMORY_STORE_BACKEND: postgres
+      MEMORY_STORE_URL: postgresql://manus:manus_dev_password@postgres:5432/manus_db
     depends_on:
       postgres:
         condition: service_healthy

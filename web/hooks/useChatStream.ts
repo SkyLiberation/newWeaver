@@ -366,12 +366,17 @@ export function useChatStream({ selectedModel, searchMode }: UseChatStreamProps)
     }
   }, [selectedModel, searchMode])
 
-  const handleApproveInterrupt = useCallback(async () => {
+  const handleApproveInterrupt = useCallback(async (resumePayload?: any) => {
     if (!pendingInterrupt || !threadId) return
     setIsLoading(true)
     setCurrentStatus('Resuming after approval...')
     try {
       const toolCalls = pendingInterrupt?.prompts?.[0]?.tool_calls
+      const payloadBody =
+        Array.isArray(toolCalls) && toolCalls.length > 0
+          ? { tool_approved: true, tool_calls: toolCalls }
+          : (resumePayload ?? {})
+
       const res = await fetch(
         `${getApiBaseUrl()}/api/interrupt/resume`,
         {
@@ -379,7 +384,7 @@ export function useChatStream({ selectedModel, searchMode }: UseChatStreamProps)
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             thread_id: threadId,
-            payload: { tool_approved: true, tool_calls: toolCalls },
+            payload: payloadBody,
             model: selectedModel,
             search_mode: searchMode
           })
@@ -387,6 +392,11 @@ export function useChatStream({ selectedModel, searchMode }: UseChatStreamProps)
       )
       if (!res.ok) throw new Error('Failed to resume')
       const data = await res.json()
+      if (data?.status === 'interrupted' && Array.isArray(data?.interrupts) && data.interrupts.length > 0) {
+        setPendingInterrupt({ prompts: data.interrupts })
+        setCurrentStatus(data.interrupts?.[0]?.instruction || 'Approval required before continuing')
+        return
+      }
       setMessages(prev => [
         ...prev,
         {

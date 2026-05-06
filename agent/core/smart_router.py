@@ -20,14 +20,14 @@ from common.config import settings
 logger = logging.getLogger(__name__)
 
 # Route types
-RouteType = Literal["direct", "agent", "web", "deep", "clarify"]
+RouteType = Literal["direct", "agent", "web", "deep"]
 
 
 class RouteDecision(BaseModel):
     """Structured output for routing decisions."""
 
     route: RouteType = Field(
-        description="The execution route: 'direct' for simple answers, 'agent' for tool-calling tasks, 'web' for quick web search, 'deep' for comprehensive research, 'clarify' for ambiguous queries"
+        description="The execution route: 'direct' for simple answers, 'agent' for tool-calling tasks, 'web' for quick web search, 'deep' for comprehensive research"
     )
     reasoning: str = Field(description="Brief explanation of why this route was chosen")
     confidence: float = Field(
@@ -36,8 +36,23 @@ class RouteDecision(BaseModel):
     suggested_queries: List[str] = Field(
         default_factory=list, description="For 'deep' or 'web' routes, suggested search queries"
     )
-    clarification_question: str = Field(
-        default="", description="For 'clarify' route, the question to ask the user"
+
+
+class ClarifyDecision(BaseModel):
+    """Structured output for clarification gating."""
+
+    need_clarification: bool = Field(
+        description="Whether the request is too ambiguous or incomplete to execute safely."
+    )
+    question: str = Field(
+        default="",
+        description="One concise clarifying question when clarification is required.",
+    )
+    confidence: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="Confidence level of the clarification decision (0-1).",
     )
 
 
@@ -72,29 +87,31 @@ ROUTER_SYSTEM_PROMPT = """You are an intelligent query router. Analyze the user'
    - Multi-faceted queries
    - Examples: "Compare the AI strategies of...", "Analyze the market trends...", "Research the pros and cons of..."
 
-5. **clarify** - Ambiguous queries needing clarification
-   - Unclear or incomplete requests
-   - Multiple possible interpretations
-   - Missing key information
-   - Examples: "Help me with this", "Fix the bug", "Make it better"
-
 ## Decision Guidelines:
 
 - Default to 'direct' for simple queries
 - Use 'agent' when tools are explicitly or implicitly needed
 - Use 'web' for time-sensitive or current information
 - Use 'deep' for research-heavy queries requiring synthesis
-- Use 'clarify' only when truly ambiguous
 
 ## Response Format:
 
 Provide your decision as a JSON object with:
-- route: one of "direct", "agent", "web", "deep", "clarify"
+- route: one of "direct", "agent", "web", "deep"
 - reasoning: brief explanation
 - confidence: 0.0 to 1.0
 - suggested_queries: for web/deep routes, 2-3 search queries
-- clarification_question: for clarify route, the question to ask
 """
+
+
+CLARIFY_SYSTEM_PROMPT = """You are a clarification gate that decides whether a user's request is clear enough to execute.
+
+Return JSON with:
+- need_clarification: true if the request is ambiguous, incomplete, or combines multiple unclear intents
+- question: one concise clarifying question when needed, otherwise an empty string
+- confidence: 0.0 to 1.0
+
+Only ask for clarification when the missing information would materially change how the system should respond."""
 
 
 class SmartRouter:
@@ -193,6 +210,47 @@ class SmartRouter:
             return RouteDecision(
                 route=self.fallback_route,
                 reasoning=f"Routing failed: {str(e)}",
+                confidence=0.5,
+            )
+
+    def should_clarify(
+        self,
+        query: str,
+        images: Optional[List[Dict[str, Any]]] = None,
+        context: Optional[str] = None,
+        config: Optional[RunnableConfig] = None,
+    ) -> ClarifyDecision:
+        """Decide whether the request needs clarification before routing."""
+        try:
+            llm = self._get_llm()
+
+            messages = [SystemMessage(content=CLARIFY_SYSTEM_PROMPT)]
+
+            user_content = query
+            if context:
+                user_content = f"Context: {context}\n\nQuery: {query}"
+            if images:
+                user_content += f"\n\n[User has attached {len(images)} image(s)]"
+
+            messages.append(HumanMessage(content=user_content))
+
+            response = llm.with_structured_output(ClarifyDecision).invoke(
+                messages,
+                config=config,
+            )
+
+            logger.info(
+                "[smart_router] clarify=%s confidence=%.2f",
+                response.need_clarification,
+                response.confidence,
+            )
+            return response
+
+        except Exception as e:
+            logger.warning(f"[smart_router] clarify check failed: {e}, defaulting to no clarify")
+            return ClarifyDecision(
+                need_clarification=False,
+                question="",
                 confidence=0.5,
             )
 
@@ -314,6 +372,22 @@ def get_smart_router() -> SmartRouter:
     return _router_instance
 
 
+def should_clarify(
+    query: str,
+    images: Optional[List[Dict[str, Any]]] = None,
+    context: Optional[str] = None,
+    config: Optional[RunnableConfig] = None,
+) -> Dict[str, Any]:
+    """Clarification gate for use in graph nodes."""
+    router = get_smart_router()
+    decision = router.should_clarify(query, images, context, config)
+    return {
+        "needs_clarification": decision.need_clarification,
+        "clarification_question": decision.question,
+        "clarify_confidence": decision.confidence,
+    }
+
+
 def smart_route(
     query: str,
     images: Optional[List[Dict[str, Any]]] = None,
@@ -356,9 +430,5 @@ def smart_route(
     # Add suggested queries for research routes
     if decision.route in ("web", "deep") and decision.suggested_queries:
         result["suggested_queries"] = decision.suggested_queries
-
-    # Add clarification question
-    if decision.route == "clarify" and decision.clarification_question:
-        result["clarification_question"] = decision.clarification_question
 
     return result

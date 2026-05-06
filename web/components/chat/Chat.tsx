@@ -2,6 +2,7 @@
 
 import React, { useRef, useEffect, useState } from 'react'
 import { Virtuoso, VirtuosoHandle } from 'react-virtuoso'
+import { useSearchParams, useRouter } from 'next/navigation'
 import { MessageItem } from './MessageItem'
 import { ArtifactsPanel } from './ArtifactsPanel'
 import { Sidebar } from './Sidebar'
@@ -22,6 +23,8 @@ import { SettingsDialog } from '@/components/settings/SettingsDialog'
 import { BrowserViewer } from './BrowserViewer'
 
 export function Chat() {
+  const searchParams = useSearchParams()
+  const router = useRouter()
   // UI State
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL)
@@ -31,6 +34,7 @@ export function Chat() {
   const [isArtifactsOpen, setIsArtifactsOpen] = useState(true)
   const [showSettings, setShowSettings] = useState(false)
   const [showBrowserViewer, setShowBrowserViewer] = useState(true) // Browser viewer visibility
+  const [interruptEditContent, setInterruptEditContent] = useState('')
 
   const [currentView, setCurrentView] = useState('dashboard') // 'dashboard' | 'discover' | 'library'
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null)
@@ -81,6 +85,15 @@ export function Chat() {
     })
   }, [currentView, threadId, showBrowserViewer])
 
+  useEffect(() => {
+    const prompt = pendingInterrupt?.prompts?.[0]
+    if (prompt && typeof prompt.content === 'string') {
+      setInterruptEditContent(prompt.content)
+    } else {
+      setInterruptEditContent('')
+    }
+  }, [pendingInterrupt])
+
   // Load Model from LocalStorage
   useEffect(() => {
       const savedModel = localStorage.getItem(STORAGE_KEYS.MODEL)
@@ -101,6 +114,40 @@ export function Chat() {
     }
   }, [messages, currentSessionId, isLoading, saveToHistory])
 
+  useEffect(() => {
+    const sessionId = searchParams.get('session')
+    if (!sessionId || sessionId === currentSessionId) return
+
+    const loadedMessages = loadSession(sessionId)
+    if (!loadedMessages) return
+
+    if (messages.length > 0) {
+      saveToHistory(messages, currentSessionId || undefined)
+    }
+
+    setMessages(loadedMessages)
+    setCurrentSessionId(sessionId)
+    setCurrentView('dashboard')
+    setArtifacts([])
+    setCurrentStatus('')
+    setInput('')
+    setThreadId(null)
+    setPendingInterrupt(null)
+    handleStop()
+  }, [
+    searchParams,
+    currentSessionId,
+    loadSession,
+    messages,
+    saveToHistory,
+    setMessages,
+    setArtifacts,
+    setCurrentStatus,
+    setThreadId,
+    setPendingInterrupt,
+    handleStop,
+  ])
+
   // Auto-scroll logic handled by Virtuoso's followOutput, 
   // but we can add specific triggers if needed.
 
@@ -111,6 +158,7 @@ export function Chat() {
       
       setCurrentView('dashboard') // Switch back to chat view
       setCurrentSessionId(null)
+      router.replace('/')
       
       // Reset state
       setMessages([])
@@ -147,6 +195,7 @@ export function Chat() {
       setMessages(loadedMessages)
       setCurrentSessionId(id)
       setCurrentView('dashboard') // Ensure we are on the chat view
+      router.replace(`/?session=${id}`)
       // Reset other state
       setArtifacts([]) 
       setCurrentStatus('')
@@ -231,7 +280,9 @@ export function Chat() {
   // Render Content based on View
   const renderContent = () => {
       if (currentView === 'discover') return <Discover />
-      if (currentView === 'library') return <Library />
+      if (currentView === 'library') {
+        return <Library onSelectSession={handleChatSelect} onNewChat={handleNewChat} />
+      }
       
       // Default: Dashboard/Chat
       return (
@@ -326,22 +377,56 @@ export function Chat() {
                     </Button>
                 </div>
 
-                {pendingInterrupt && (
-                <div className="mx-4 mb-3 p-3 border rounded-xl bg-amber-50 text-amber-900 shadow-sm flex flex-col gap-2">
-                    <div className="text-sm font-semibold">Tool approval required</div>
-                    <div className="text-xs text-amber-800">
-                    {pendingInterrupt.message || pendingInterrupt?.prompts?.[0]?.message || 'Approve tool execution to continue.'}
+                {pendingInterrupt && (() => {
+                  const prompt = pendingInterrupt?.prompts?.[0] || {}
+                  const checkpoint = typeof prompt?.checkpoint === 'string' ? prompt.checkpoint : ''
+                  const isDraftReview = checkpoint === 'draft'
+                  const title = isDraftReview ? 'Draft review required' : 'Tool approval required'
+                  const description =
+                    pendingInterrupt.message ||
+                    prompt.instruction ||
+                    prompt.message ||
+                    (isDraftReview
+                      ? 'Review the draft below, edit if needed, then continue.'
+                      : 'Approve tool execution to continue.')
+
+                  return (
+                    <div className="mx-4 mb-3 p-3 border rounded-xl bg-amber-50 text-amber-900 shadow-sm flex flex-col gap-2">
+                      <div className="text-sm font-semibold">{title}</div>
+                      <div className="text-xs text-amber-800 whitespace-pre-wrap">
+                        {description}
+                      </div>
+                      {isDraftReview && (
+                        <textarea
+                          value={interruptEditContent}
+                          onChange={(e) => setInterruptEditContent(e.target.value)}
+                          className="min-h-40 w-full rounded-lg border border-amber-200 bg-white/90 p-3 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-300"
+                        />
+                      )}
+                      <div className="flex gap-2">
+                        <Button
+                          size="sm"
+                          onClick={() =>
+                            isDraftReview
+                              ? handleApproveInterrupt({ content: interruptEditContent })
+                              : handleApproveInterrupt()
+                          }
+                          disabled={isLoading}
+                        >
+                          {isDraftReview ? 'Save & Continue' : 'Approve & Continue'}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => setPendingInterrupt(null)}
+                          disabled={isLoading}
+                        >
+                          Dismiss
+                        </Button>
+                      </div>
                     </div>
-                    <div className="flex gap-2">
-                    <Button size="sm" onClick={handleApproveInterrupt} disabled={isLoading}>
-                        Approve & Continue
-                    </Button>
-                    <Button size="sm" variant="ghost" onClick={() => setPendingInterrupt(null)} disabled={isLoading}>
-                        Dismiss
-                    </Button>
-                    </div>
-                </div>
-                )}
+                  )
+                })()}
            </>
         )}
 

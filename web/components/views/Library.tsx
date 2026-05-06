@@ -12,12 +12,14 @@ import { FilterGroup } from '@/components/ui/filter-group'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { EditDialog } from '@/components/ui/edit-dialog'
 import { Button } from '@/components/ui/button'
-import { useRouter } from 'next/navigation'
-
 type LibraryTab = 'all' | 'sessions' | 'artifacts' | 'pinned'
 
-export function Library() {
-  const router = useRouter()
+interface LibraryProps {
+  onSelectSession?: (id: string) => void
+  onNewChat?: () => void
+}
+
+export function Library({ onSelectSession, onNewChat }: LibraryProps) {
   const { history, deleteSession, togglePin, renameSession, isHistoryLoading } = useChatHistory()
   const { artifacts, deleteArtifact, isLoading: isArtifactsLoading } = useArtifacts()
 
@@ -94,7 +96,7 @@ export function Library() {
             </p>
           </div>
           <div className="flex items-center gap-2">
-             <Button variant="outline" size="sm" onClick={() => router.push('/')}>
+             <Button variant="outline" size="sm" onClick={onNewChat}>
                 New Chat
              </Button>
           </div>
@@ -130,7 +132,7 @@ export function Library() {
                     <SessionItem 
                       key={item.id} 
                       session={item} 
-                      onSelect={(id) => router.push(`/?session=${id}`)}
+                      onSelect={(id) => onSelectSession?.(id)}
                       onDelete={(id) => { setDeleteId(id); setDeleteType('session'); }}
                       onRename={(id) => setEditSession({ id, title: item.title })}
                       onTogglePin={togglePin}

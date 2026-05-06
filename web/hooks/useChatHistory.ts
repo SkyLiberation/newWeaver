@@ -52,7 +52,7 @@ export function useChatHistory() {
     setHistory(saved)
   }, [])
 
-  const saveToHistory = (messages: Message[], currentSessionId?: string) => {
+  const saveToHistory = useCallback((messages: Message[], currentSessionId?: string) => {
     if (messages.length === 0) return null
 
     const timestamp = Date.now()
@@ -101,11 +101,11 @@ export function useChatHistory() {
     }
     
     return sessionId
-  }
+  }, [])
 
-  const loadSession = (id: string): Message[] | null => {
+  const loadSession = useCallback((id: string): Message[] | null => {
     return StorageService.getSessionMessages(id)
-  }
+  }, [])
 
   const deleteSession = (id: string) => {
     setHistory(prev => prev.filter(s => s.id !== id))

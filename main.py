@@ -441,8 +441,16 @@ def _init_store():
         if not url:
             raise ValueError("memory_store_url is required when memory_store_backend=postgres")
         from langgraph.store.postgres import PostgresStore
+        import psycopg
+        from psycopg.rows import dict_row
 
-        store_obj = PostgresStore.from_conn_string(url)
+        store_conn = psycopg.connect(
+            url,
+            autocommit=True,
+            prepare_threshold=0,
+            row_factory=dict_row,
+        )
+        store_obj = PostgresStore(store_conn)
         store_obj.setup()
         logger.info("Initialized PostgresStore for long-term memory")
         return store_obj
@@ -707,6 +715,7 @@ class Message(BaseModel):
 
 
 class SearchMode(BaseModel):
+    mode: Optional[str] = None
     useWebSearch: bool = False
     useAgent: bool = False
     useDeepSearch: bool = False
@@ -727,39 +736,57 @@ def _coerce_search_mode_input(value: Any) -> SearchMode | None:
 
     if isinstance(value, str):
         lowered = value.strip().lower()
-        if lowered in {"", "direct"}:
-            return SearchMode()
+        if lowered == "":
+            return SearchMode(mode="auto")
+        if lowered == "direct":
+            return SearchMode(mode="direct")
         if lowered in {"web", "search", "tavily"}:
-            return SearchMode(useWebSearch=True)
+            return SearchMode(mode="web", useWebSearch=True)
         if lowered in {"mcp"}:
             # Frontend UX label: "MCP" is implemented as tool-calling agent mode.
-            return SearchMode(useAgent=True)
+            return SearchMode(mode="agent", useAgent=True)
         if lowered in {"agent"}:
-            return SearchMode(useAgent=True)
+            return SearchMode(mode="agent", useAgent=True)
         if lowered in {"deep", "deep_agent", "deep-agent", "ultra"}:
-            return SearchMode(useAgent=True, useDeepSearch=True)
+            return SearchMode(mode="deep", useAgent=True, useDeepSearch=True)
         # Unknown string → treat as direct.
-        return SearchMode()
+        return SearchMode(mode="auto")
 
     if isinstance(value, dict):
+        raw_mode = value.get("mode")
+        mode = raw_mode.strip().lower() if isinstance(raw_mode, str) else None
         use_web = bool(value.get("useWebSearch", value.get("use_web", False)))
         use_agent = bool(value.get("useAgent", value.get("use_agent", False)))
         use_deep = bool(value.get("useDeepSearch", value.get("use_deep", False)))
 
         # If booleans were not provided but a mode string exists, derive flags from it.
-        if not (use_web or use_agent or use_deep) and isinstance(value.get("mode"), str):
-            mode_lower = value["mode"].strip().lower()
-            if mode_lower == "web":
+        if not (use_web or use_agent or use_deep) and mode:
+            if mode == "web":
                 use_web = True
-            elif mode_lower in {"agent", "deep"}:
+            elif mode in {"agent", "deep"}:
                 use_agent = True
-                use_deep = mode_lower == "deep"
+                use_deep = mode == "deep"
 
         # Deep requires agent.
         if use_deep and not use_agent:
             use_deep = False
 
-        return SearchMode(useWebSearch=use_web, useAgent=use_agent, useDeepSearch=use_deep)
+        if mode not in {"auto", "direct", "web", "agent", "deep"}:
+            if use_deep:
+                mode = "deep"
+            elif use_agent:
+                mode = "agent"
+            elif use_web:
+                mode = "web"
+            else:
+                mode = "auto"
+
+        return SearchMode(
+            mode=mode,
+            useWebSearch=use_web,
+            useAgent=use_agent,
+            useDeepSearch=use_deep,
+        )
 
     return None
 
@@ -1072,6 +1099,43 @@ def _serialize_interrupts(interrupts: Any) -> List[Any]:
         else:
             result.append(str(item))
     return result
+
+
+def _get_pending_interrupt_prompts_for_thread(thread_id: str) -> List[Any]:
+    """
+    Read pending LangGraph interrupt payloads from the checkpointer for a thread.
+
+    `astream_events()` may finish without surfacing the final `__interrupt__`
+    payload in streamed event outputs, while the checkpointer still contains the
+    pending interrupt write. This helper lets stream endpoints emit the expected
+    interrupt event to the frontend before incorrectly sending `done`.
+    """
+    if not checkpointer or not thread_id:
+        return []
+
+    try:
+        config = {"configurable": {"thread_id": thread_id}}
+        checkpoint_tuple = checkpointer.get_tuple(config)
+        if not checkpoint_tuple:
+            return []
+
+        pending_writes = getattr(checkpoint_tuple, "pending_writes", []) or []
+        interrupt_items: List[Any] = []
+        for entry in pending_writes:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+                continue
+            _, key, value = entry
+            if key != "__interrupt__":
+                continue
+            if isinstance(value, (list, tuple)):
+                interrupt_items.extend(list(value))
+            elif value is not None:
+                interrupt_items.append(value)
+
+        return _serialize_interrupts(interrupt_items)
+    except Exception as e:
+        logger.debug(f"Failed to read pending interrupts for thread {thread_id}: {e}")
+        return []
 
 
 def _normalize_interrupt_resume_payload(payload: Any) -> Any:
@@ -1565,11 +1629,14 @@ def _compact_tool_args(tool_input: Any) -> Dict[str, Any]:
 
 def _normalize_search_mode(search_mode: SearchMode | Dict[str, Any] | str | None) -> Dict[str, Any]:
     if isinstance(search_mode, SearchMode):
+        requested_mode = (search_mode.mode or "").strip().lower()
         use_web = search_mode.useWebSearch
         use_agent = search_mode.useAgent
         use_deep = search_mode.useDeepSearch
         use_deep_prompt = use_deep
     elif isinstance(search_mode, dict):
+        raw_mode = search_mode.get("mode")
+        requested_mode = raw_mode.strip().lower() if isinstance(raw_mode, str) else ""
         # Support both camelCase (frontend payload) and snake_case (already-normalized)
         use_web = bool(search_mode.get("useWebSearch", search_mode.get("use_web", False)))
         use_agent = bool(search_mode.get("useAgent", search_mode.get("use_agent", False)))
@@ -1579,16 +1646,16 @@ def _normalize_search_mode(search_mode: SearchMode | Dict[str, Any] | str | None
         )
 
         # If booleans were not provided but a mode string exists, derive flags from it
-        if not (use_web or use_agent or use_deep) and isinstance(search_mode.get("mode"), str):
-            mode_lower = search_mode["mode"].strip().lower()
-            if mode_lower == "web":
+        if not (use_web or use_agent or use_deep) and requested_mode:
+            if requested_mode == "web":
                 use_web = True
-            elif mode_lower in {"agent", "deep"}:
+            elif requested_mode in {"agent", "deep"}:
                 use_agent = True
-                use_deep = mode_lower == "deep"
+                use_deep = requested_mode == "deep"
                 use_deep_prompt = use_deep
     elif isinstance(search_mode, str):
         lowered = search_mode.lower().strip()
+        requested_mode = lowered if lowered else "auto"
 
         # UX labels
         if lowered in {"direct", ""}:
@@ -1602,6 +1669,7 @@ def _normalize_search_mode(search_mode: SearchMode | Dict[str, Any] | str | None
             use_deep = lowered in {"deep", "deep_agent", "deep-agent", "ultra"}
             use_deep_prompt = use_deep
     else:
+        requested_mode = "auto"
         use_web = False
         use_agent = False
         use_deep = False
@@ -1611,18 +1679,21 @@ def _normalize_search_mode(search_mode: SearchMode | Dict[str, Any] | str | None
         use_deep = False
         use_deep_prompt = False
 
-    if use_agent:
-        mode = "deep" if use_deep else "agent"
-    elif use_web:
-        mode = "web"
-    else:
-        mode = "direct"
+    if requested_mode not in {"auto", "direct", "web", "agent", "deep"}:
+        if use_deep:
+            requested_mode = "deep"
+        elif use_agent:
+            requested_mode = "agent"
+        elif use_web:
+            requested_mode = "web"
+        else:
+            requested_mode = "auto"
 
     return {
         "use_web": use_web,
         "use_agent": use_agent,
         "use_deep": use_deep,
-        "mode": mode,
+        "mode": requested_mode,
         "use_deep_prompt": use_deep_prompt,
     }
 
@@ -2190,6 +2261,20 @@ async def stream_agent_events(
         async for queued_chunk in _drain_pending_tool_events():
             yield queued_chunk
 
+        pending_interrupts = _get_pending_interrupt_prompts_for_thread(thread_id)
+        if pending_interrupts:
+            was_interrupted = True
+            logger.info(
+                "Agent stream paused at interrupt | Thread: %s | Prompts: %s",
+                thread_id,
+                len(pending_interrupts),
+            )
+            yield await format_stream_event(
+                "interrupt",
+                {"thread_id": thread_id, "prompts": pending_interrupts},
+            )
+            return
+
         # Send final completion
         duration = time.time() - start_time
         cancel_token.mark_completed()
@@ -2444,7 +2529,7 @@ async def chat(request: Request, payload: ChatRequest):
                 "draft_report": "",
                 "evaluation": "",
                 "verdict": "",
-                "route": mode_info.get("mode", "direct"),
+                "route": mode_info.get("mode", "auto"),
                 "revision_count": 0,
                 "max_revisions": settings.max_revisions,
                 "is_complete": False,
@@ -2488,7 +2573,7 @@ async def chat(request: Request, payload: ChatRequest):
             }
             thread_id = thread_id or f"thread_{uuid.uuid4().hex}"
             metrics = metrics_registry.start(
-                thread_id, model=model, route=mode_info.get("mode", "direct")
+                thread_id, model=model, route=mode_info.get("mode", "auto")
             )
             result = await research_graph.ainvoke(initial_state, config=config)
             final_report = result.get("final_report", "No response generated")

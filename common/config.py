@@ -305,7 +305,7 @@ class Settings(BaseSettings):
     enable_report_charts: bool = True  # Generate charts from data in reports
 
     # Human-in-the-Loop (HITL) Config
-    hitl_checkpoints: str = ""  # Comma-separated interrupt points: plan,sources,draft,final
+    hitl_checkpoints: str = "draft"  # Comma-separated interrupt points: plan,sources,draft,final
     hitl_timeout_seconds: int = 3600  # Max wait time for human review (1 hour)
 
     # Prompt Config (选择提示词风格)
