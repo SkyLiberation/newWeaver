@@ -21,6 +21,7 @@ from agent.workflows.browser_context_helper import build_browser_context_hint
 from agent.workflows.stuck_middleware import detect_stuck, inject_stuck_hint
 from common.cancellation import check_cancellation as _check_cancellation
 from common.config import settings
+from common.tracing import SpanKind, get_current_context, trace_node
 from tools import execute_python_code, tavily_search
 from tools.core.registry import get_global_registry, get_registered_tools
 
@@ -508,6 +509,45 @@ def _log_usage(response: Any, node: str) -> None:
         logger.info(f"[usage] {node}: {usage}")
 
 
+def _usage_token_counts(response: Any) -> tuple[int, int]:
+    """Best-effort token extraction for LLM spans."""
+    if not response:
+        return 0, 0
+
+    usage = getattr(response, "usage_metadata", None)
+    if not usage:
+        usage = getattr(response, "response_metadata", None)
+    if not isinstance(usage, dict):
+        return 0, 0
+
+    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+    output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+    try:
+        return int(input_tokens), int(output_tokens)
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+def _invoke_llm_with_trace(
+    runnable: Any,
+    payload: Any,
+    *,
+    config: Optional[RunnableConfig],
+    span_name: str,
+    model: str = "",
+) -> Any:
+    """Invoke an LLM/runnable and attach token-aware trace data when enabled."""
+    ctx = get_current_context()
+    if ctx is None:
+        return runnable.invoke(payload, config=config)
+
+    with ctx.span(span_name, SpanKind.LLM_CALL, model=model) as span:
+        response = runnable.invoke(payload, config=config)
+        input_tokens, output_tokens = _usage_token_counts(response)
+        span.set_tokens(input_tokens, output_tokens)
+        return response
+
+
 def initialize_enhanced_tools() -> None:
     """
     Initialize enhanced tool system (Phase 1-4).
@@ -722,6 +762,7 @@ def _build_user_content(
     return parts
 
 
+@trace_node
 def perform_parallel_search(state: QueryState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Executes a single search query in parallel.
@@ -796,7 +837,23 @@ def perform_parallel_search(state: QueryState, config: RunnableConfig) -> Dict[s
         enforce_tool_call_limit(state, settings.tool_call_limit)
 
         call_kwargs = {"query": query, "max_results": 5}
-        if settings.tool_retry:
+        ctx = get_current_context()
+        if ctx is not None:
+            with ctx.span(
+                "tavily_search",
+                SpanKind.SEARCH,
+                attributes={"query": query, "max_results": call_kwargs["max_results"]},
+            ):
+                if settings.tool_retry:
+                    results = retry_call(
+                        tavily_search.invoke,
+                        attempts=settings.tool_retry_max_attempts,
+                        backoff=settings.tool_retry_backoff,
+                        **{"input": call_kwargs, "config": config},
+                    )
+                else:
+                    results = tavily_search.invoke(call_kwargs, config=config)
+        elif settings.tool_retry:
             results = retry_call(
                 tavily_search.invoke,
                 attempts=settings.tool_retry_max_attempts,
@@ -848,6 +905,7 @@ def perform_parallel_search(state: QueryState, config: RunnableConfig) -> Dict[s
         return {"scraped_content": []}
 
 
+@trace_node
 def coordinator_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Coordinator node that decides the next research action.
@@ -940,6 +998,7 @@ def coordinator_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any
         }
 
 
+@trace_node
 def deepsearch_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """Deep search pipeline that iterates query → search → summarize."""
     logger.info("Executing deepsearch node")
@@ -1058,6 +1117,7 @@ def deepsearch_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
         }
 
 
+@trace_node
 def route_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Route execution using SmartRouter (LLM-based intelligent routing).
@@ -1122,6 +1182,7 @@ def route_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     return result
 
 
+@trace_node
 def clarify_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Light-weight guardrail to decide if the query needs clarification before planning.
@@ -1163,10 +1224,12 @@ def clarify_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     )
 
     try:
-        response = (
-            llm.with_structured_output(ClarifyResponse)
-            .with_retry(stop_after_attempt=2)
-            .invoke([system_msg, human_msg], config=config)
+        response = _invoke_llm_with_trace(
+            llm.with_structured_output(ClarifyResponse).with_retry(stop_after_attempt=2),
+            [system_msg, human_msg],
+            config=config,
+            span_name="clarify_llm",
+            model=_model_for_task("routing", config),
         )
         _log_usage(response, "clarify")
     except Exception as e:
@@ -1191,6 +1254,7 @@ def clarify_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     return {"needs_clarification": False, "messages": [AIMessage(content=verification)]}
 
 
+@trace_node
 def direct_answer_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """Direct answer without research."""
     logger.info("Executing direct answer node")
@@ -1200,7 +1264,13 @@ def direct_answer_node(state: AgentState, config: RunnableConfig) -> Dict[str, A
         SystemMessage(content="You are a helpful assistant. Answer succinctly and accurately."),
         HumanMessage(content=_build_user_content(state["input"], state.get("images"))),
     ]
-    response = llm.invoke(messages, config=config)
+    response = _invoke_llm_with_trace(
+        llm,
+        messages,
+        config=config,
+        span_name="direct_answer_llm",
+        model=_model_for_task("writing", config),
+    )
     _log_usage(response, "direct_answer")
     logger.info(f"[timing] direct_answer {(time.time() - t0):.3f}s")
     content = response.content if hasattr(response, "content") else str(response)
@@ -1236,6 +1306,7 @@ def initiate_research(state: AgentState) -> List[Send]:
     return [Send("perform_parallel_search", {"query": q}) for q in unique_queries]
 
 
+@trace_node
 def planner_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Planning node: Creates a structured research plan.
@@ -1265,10 +1336,12 @@ def planner_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
         )
         human_msg = HumanMessage(content=_build_user_content(state["input"], state.get("images")))
 
-        response = (
-            llm.with_structured_output(PlanResponse)
-            .with_retry(stop_after_attempt=2)
-            .invoke([system_msg, human_msg], config=config)
+        response = _invoke_llm_with_trace(
+            llm.with_structured_output(PlanResponse).with_retry(stop_after_attempt=2),
+            [system_msg, human_msg],
+            config=config,
+            span_name="planner_llm",
+            model=_model_for_task("planning", config),
         )
 
         # LLM 调用后检查取消状态
@@ -1735,6 +1808,7 @@ def web_search_plan_node(state: AgentState, config: RunnableConfig) -> Dict[str,
     }
 
 
+@trace_node
 def agent_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Agent node: Tool-calling loop (GPTs/Manus-like) with enhanced features.
@@ -1832,7 +1906,13 @@ You can also use XML format for tool calls:
             HumanMessage(content=_build_user_content(state.get("input", ""), state.get("images")))
         )
 
-        response = agent.invoke({"messages": messages}, config=config)
+        response = _invoke_llm_with_trace(
+            agent,
+            {"messages": messages},
+            config=config,
+            span_name="agent_llm",
+            model=model,
+        )
         logger.info(f"[timing] agent {(time.time() - t0):.3f}s")
 
         text = ""
@@ -1894,6 +1974,7 @@ You can also use XML format for tool calls:
         }
 
 
+@trace_node
 def compressor_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Compressor node: Extracts and structures key facts from research.
@@ -1958,6 +2039,7 @@ def compressor_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
         return {"compressed_knowledge": {}}
 
 
+@trace_node
 def writer_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Writer node: Synthesizes research into a comprehensive report.
@@ -2034,10 +2116,22 @@ def writer_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
             )
 
         if use_tools and agent is not None:
-            response = agent.invoke({"messages": messages}, config=config)
+            response = _invoke_llm_with_trace(
+                agent,
+                {"messages": messages},
+                config=config,
+                span_name="writer_agent_llm",
+                model=model,
+            )
         else:
             llm = _chat_model(model, temperature=0.7)
-            response = llm.invoke(messages)
+            response = _invoke_llm_with_trace(
+                llm,
+                messages,
+                config=config,
+                span_name="writer_llm",
+                model=model,
+            )
         logger.info(f"[timing] writer {(time.time() - t0):.3f}s")
 
         report = ""
@@ -2106,6 +2200,7 @@ def should_continue_research(state: AgentState) -> str:
         return "write"
 
 
+@trace_node
 def evaluator_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Evaluate the draft report with structured, multi-dimensional feedback.
@@ -2196,8 +2291,12 @@ Provide specific, actionable feedback and search queries to address gaps.""",
     report = state.get("draft_report") or state.get("final_report", "")
 
     try:
-        response = llm.with_structured_output(EvalResponse).invoke(
-            prompt.format_messages(report=report, question=state["input"]), config=config
+        response = _invoke_llm_with_trace(
+            llm.with_structured_output(EvalResponse),
+            prompt.format_messages(report=report, question=state["input"]),
+            config=config,
+            span_name="evaluator_llm",
+            model=_model_for_task("evaluation", config),
         )
         _log_usage(response, "evaluator")
         logger.info(f"[timing] evaluator {(time.time() - t0):.3f}s")
@@ -2421,6 +2520,7 @@ Provide specific, actionable feedback and search queries to address gaps.""",
         return {"evaluation": f"Evaluation failed: {e}", "verdict": "pass"}
 
 
+@trace_node
 def revise_report_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """Revise the report based on evaluator feedback."""
     logger.info("Executing revise report node")
@@ -2441,9 +2541,12 @@ Keep the structure clear and improve factual accuracy and clarity.""",
 
     report = state.get("draft_report") or state.get("final_report", "")
     feedback = state.get("evaluation", "")
-    response = llm.invoke(
+    response = _invoke_llm_with_trace(
+        llm,
         prompt.format_messages(question=state["input"], feedback=feedback, report=report),
         config=config,
+        span_name="revise_report_llm",
+        model=_model_for_task("writing", config),
     )
     content = response.content if hasattr(response, "content") else str(response)
 

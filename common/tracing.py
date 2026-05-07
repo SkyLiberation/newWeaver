@@ -16,6 +16,7 @@ import logging
 import time
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -346,10 +347,11 @@ class TracingContext:
 _global_store: Optional[TraceStore] = None
 _global_store_lock = Lock()
 
-# Thread-local current context
-import threading
-
-_thread_local = threading.local()
+# Async-safe current context for request/task-local tracing
+_current_context: ContextVar[Optional["TracingContext"]] = ContextVar(
+    "weaver_tracing_context",
+    default=None,
+)
 
 
 def get_trace_store() -> TraceStore:
@@ -365,12 +367,12 @@ def get_trace_store() -> TraceStore:
 
 def get_current_context() -> Optional[TracingContext]:
     """Get the current tracing context for this thread."""
-    return getattr(_thread_local, "context", None)
+    return _current_context.get()
 
 
 def set_current_context(ctx: Optional[TracingContext]) -> None:
     """Set the current tracing context for this thread."""
-    _thread_local.context = ctx
+    _current_context.set(ctx)
 
 
 @contextmanager

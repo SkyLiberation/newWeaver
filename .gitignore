@@ -140,3 +140,5 @@ nul
 graph_mermaid.md
 web/package-lock.json
 db_export
+.test.json
+tools/data/memory_store.json
