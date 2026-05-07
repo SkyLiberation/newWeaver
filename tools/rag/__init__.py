@@ -8,6 +8,12 @@ Provides functionality for:
 - Retrieval-augmented generation
 """
 
+from tools.rag.chunking import (
+    BasicChunkingStrategy,
+    ChunkingStrategy,
+    SemanticChunkingStrategy,
+    build_chunking_strategy,
+)
 from tools.rag.document_loader import Document, DocumentLoader
 from tools.rag.embedder import Embedder
 from tools.rag.manager import RAGManager
@@ -17,6 +23,10 @@ from tools.rag.vector_store import VectorStore
 __all__ = [
     "DocumentLoader",
     "Document",
+    "ChunkingStrategy",
+    "BasicChunkingStrategy",
+    "SemanticChunkingStrategy",
+    "build_chunking_strategy",
     "Embedder",
     "RAGManager",
     "VectorStore",

@@ -1,3 +1,4 @@
+import logging
 import operator
 from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 
@@ -6,8 +7,45 @@ from langgraph.graph.message import add_messages
 
 from agent.core.message_utils import summarize_messages
 from common.config import settings
+from common.tracing import SpanKind, get_current_context
 
 from .middleware import maybe_strip_tool_messages
+
+logger = logging.getLogger(__name__)
+
+
+def _observe_message_trim(
+    *,
+    before_count: int,
+    after_count: int,
+    keep_first: int,
+    keep_last: int,
+    used_summary: bool,
+    cleared_middle_count: int,
+) -> None:
+    attributes = {
+        "before_messages": before_count,
+        "after_messages": after_count,
+        "removed_messages": max(0, before_count - after_count),
+        "keep_first": keep_first,
+        "keep_last": keep_last,
+        "used_summary": used_summary,
+        "cleared_middle_count": max(0, cleared_middle_count),
+    }
+
+    logger.info(
+        "[message_trim] %s -> %s messages | removed=%s | cleared_middle=%s | used_summary=%s",
+        before_count,
+        after_count,
+        attributes["removed_messages"],
+        attributes["cleared_middle_count"],
+        used_summary,
+    )
+
+    ctx = get_current_context()
+    if ctx is not None:
+        with ctx.span("message_history_trim", SpanKind.CUSTOM, attributes=attributes):
+            pass
 
 
 def capped_add_messages(
@@ -27,6 +65,7 @@ def capped_add_messages(
     if not settings.trim_messages:
         return merged
 
+    before_count = len(merged)
     keep_first = max(int(getattr(settings, "trim_messages_keep_first", 1)), 0)
     keep_last = max(int(getattr(settings, "trim_messages_keep_last", 8)), 0)
     if keep_first + keep_last == 0 or len(merged) <= keep_first + keep_last:
@@ -35,12 +74,25 @@ def capped_add_messages(
     head = merged[:keep_first] if keep_first else []
     tail = merged[-keep_last:] if keep_last else []
     trimmed = head + tail
+    middle_count = max(0, len(merged) - len(head) - len(tail))
+    used_summary = False
 
     # Optional summarization of middle history
     if settings.summary_messages and len(merged) > settings.summary_messages_trigger:
         middle = merged[keep_first : len(merged) - keep_last]
         summary_msg = summarize_messages(middle)
         trimmed = head + [summary_msg] + tail
+        used_summary = True
+
+    if len(trimmed) != before_count:
+        _observe_message_trim(
+            before_count=before_count,
+            after_count=len(trimmed),
+            keep_first=keep_first,
+            keep_last=keep_last,
+            used_summary=used_summary,
+            cleared_middle_count=middle_count,
+        )
 
     return trimmed
 

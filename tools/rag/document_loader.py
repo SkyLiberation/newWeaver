@@ -4,19 +4,22 @@ Document Loader for RAG Pipeline.
 Parses various document formats into text chunks for embedding.
 """
 
+from __future__ import annotations
+
 import hashlib
 import logging
-import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
+
+from tools.rag.chunking import build_chunking_strategy
 
 logger = logging.getLogger(__name__)
 
 # Check for optional dependencies
 try:
     import fitz  # PyMuPDF
+
     PYMUPDF_AVAILABLE = True
 except ImportError:
     fitz = None
@@ -24,6 +27,7 @@ except ImportError:
 
 try:
     from docx import Document as DocxDocument
+
     DOCX_AVAILABLE = True
 except ImportError:
     DocxDocument = None
@@ -33,6 +37,7 @@ except ImportError:
 @dataclass
 class Document:
     """A document chunk with metadata."""
+
     content: str
     metadata: Dict[str, Any] = field(default_factory=dict)
     doc_id: str = ""
@@ -59,6 +64,7 @@ class DocumentLoader:
         self,
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
+        chunk_strategy: str = "semantic",
     ):
         """
         Initialize the document loader.
@@ -66,9 +72,16 @@ class DocumentLoader:
         Args:
             chunk_size: Maximum characters per chunk
             chunk_overlap: Overlap between chunks for context continuity
+            chunk_strategy: Chunking strategy ("basic" or "semantic")
         """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.chunk_strategy = (chunk_strategy or "semantic").strip().lower()
+        self._chunker = build_chunking_strategy(
+            self.chunk_strategy,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
 
     def load(self, file_path: Union[str, Path]) -> List[Document]:
         """
@@ -99,7 +112,6 @@ class DocumentLoader:
         elif suffix in (".txt", ".md", ".markdown", ".rst"):
             text = self._load_text(path)
         else:
-            # Try as plain text
             try:
                 text = self._load_text(path)
             except Exception as e:
@@ -115,7 +127,7 @@ class DocumentLoader:
         self,
         content: bytes,
         filename: str,
-        file_type: str = None,
+        file_type: str | None = None,
     ) -> List[Document]:
         """
         Load a document from bytes.
@@ -138,7 +150,6 @@ class DocumentLoader:
         }
 
         text = ""
-
         if file_type in (".pdf", "pdf"):
             text = self._parse_pdf_bytes(content)
         elif file_type in (".docx", ".doc", "docx", "doc"):
@@ -204,6 +215,7 @@ class DocumentLoader:
             raise ImportError("python-docx is required for DOCX parsing.")
 
         import io
+
         doc = DocxDocument(io.BytesIO(content))
         paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
         return "\n\n".join(paragraphs)
@@ -221,76 +233,47 @@ class DocumentLoader:
         metadata: Dict[str, Any],
     ) -> List[Document]:
         """
-        Split text into chunks with overlap.
-
-        Uses sentence-aware splitting when possible.
+        Split text into chunks using the configured strategy.
         """
-        # Clean up text
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r" {2,}", " ", text)
+        prepared_text = self._prepare_text(text)
+        if not prepared_text:
+            return []
 
-        chunks = []
-        doc_id = hashlib.md5(text[:1000].encode()).hexdigest()[:12]
-
-        if len(text) <= self.chunk_size:
-            return [Document(
-                content=text.strip(),
-                metadata=metadata,
+        doc_id = hashlib.md5(prepared_text[:1000].encode()).hexdigest()[:12]
+        chunk_payloads = self._chunker.chunk(prepared_text, metadata)
+        chunks = [
+            Document(
+                content=payload.content,
+                metadata=payload.metadata,
                 doc_id=doc_id,
-            )]
+            )
+            for payload in chunk_payloads
+        ]
 
-        # Split by paragraphs first
-        paragraphs = text.split("\n\n")
-        current_chunk = ""
-
-        for para in paragraphs:
-            para = para.strip()
-            if not para:
-                continue
-
-            if len(current_chunk) + len(para) + 2 <= self.chunk_size:
-                current_chunk = f"{current_chunk}\n\n{para}" if current_chunk else para
-            else:
-                if current_chunk:
-                    chunks.append(Document(
-                        content=current_chunk.strip(),
-                        metadata={**metadata, "chunk_index": len(chunks)},
-                        doc_id=doc_id,
-                    ))
-                    # Overlap: keep last part of current chunk
-                    overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else ""
-                    current_chunk = f"{overlap_text}\n\n{para}" if overlap_text else para
-                else:
-                    # Paragraph itself is too long, split by sentences
-                    sentences = re.split(r"(?<=[.!?])\s+", para)
-                    for sent in sentences:
-                        if len(current_chunk) + len(sent) + 1 <= self.chunk_size:
-                            current_chunk = f"{current_chunk} {sent}" if current_chunk else sent
-                        else:
-                            if current_chunk:
-                                chunks.append(Document(
-                                    content=current_chunk.strip(),
-                                    metadata={**metadata, "chunk_index": len(chunks)},
-                                    doc_id=doc_id,
-                                ))
-                            current_chunk = sent
-
-        # Don't forget the last chunk
-        if current_chunk.strip():
-            chunks.append(Document(
-                content=current_chunk.strip(),
-                metadata={**metadata, "chunk_index": len(chunks)},
-                doc_id=doc_id,
-            ))
-
-        logger.info(f"Split document into {len(chunks)} chunks")
+        logger.info(
+            "Split document into %s chunks using %s strategy",
+            len(chunks),
+            self.chunk_strategy,
+        )
         return chunks
+
+    def _prepare_text(self, text: str) -> str:
+        """Normalize raw extracted text before chunking."""
+        prepared = text or ""
+        prepared = prepared.replace("\r\n", "\n").replace("\r", "\n")
+        prepared = prepared.replace("\t", " ")
+        prepared = prepared.replace("\u00a0", " ")
+        prepared = prepared.replace("\u3000", " ")
+        prepared = prepared.replace("\ufeff", "")
+        prepared = prepared.strip()
+        return prepared
 
 
 def load_documents(
     paths: List[Union[str, Path]],
     chunk_size: int = 1000,
     chunk_overlap: int = 200,
+    chunk_strategy: str = "semantic",
 ) -> List[Document]:
     """
     Load multiple documents.
@@ -299,11 +282,16 @@ def load_documents(
         paths: List of file paths
         chunk_size: Maximum characters per chunk
         chunk_overlap: Overlap between chunks
+        chunk_strategy: Chunking strategy ("basic" or "semantic")
 
     Returns:
         List of all Document chunks
     """
-    loader = DocumentLoader(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    loader = DocumentLoader(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        chunk_strategy=chunk_strategy,
+    )
     all_docs = []
 
     for path in paths:

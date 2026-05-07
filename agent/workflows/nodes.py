@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
@@ -15,6 +15,7 @@ from langgraph.types import Send, interrupt
 from pydantic import BaseModel, Field
 
 from agent.core.events import ToolEventType, get_emitter_sync
+from agent.core.context_manager import get_context_manager, truncate_for_model
 from agent.core.middleware import enforce_tool_call_limit, retry_call
 from agent.core.state import AgentState, QueryState
 from agent.workflows.browser_context_helper import build_browser_context_hint
@@ -429,7 +430,13 @@ def _answer_simple_agent_query(
     )
 
     llm = _chat_model(_model_for_task("writing", config), temperature=0.2)
-    response = llm.invoke(messages, config=config)
+    response = _invoke_llm_with_trace(
+        llm,
+        messages,
+        config=config,
+        span_name="agent_fast_search_llm",
+        model=_model_for_task("writing", config),
+    )
     _log_usage(response, "agent_fast_search")
 
     content = response.content if hasattr(response, "content") else str(response)
@@ -537,15 +544,97 @@ def _invoke_llm_with_trace(
     model: str = "",
 ) -> Any:
     """Invoke an LLM/runnable and attach token-aware trace data when enabled."""
+    payload, compression_meta = _truncate_payload_messages(payload, model=model)
     ctx = get_current_context()
     if ctx is None:
         return runnable.invoke(payload, config=config)
 
     with ctx.span(span_name, SpanKind.LLM_CALL, model=model) as span:
+        if compression_meta:
+            span.attributes.update(compression_meta)
+            with ctx.span(
+                "context_compression",
+                SpanKind.CUSTOM,
+                attributes=compression_meta,
+            ):
+                pass
         response = runnable.invoke(payload, config=config)
         input_tokens, output_tokens = _usage_token_counts(response)
         span.set_tokens(input_tokens, output_tokens)
         return response
+
+
+def _truncate_payload_messages(
+    payload: Any,
+    *,
+    model: str = "",
+) -> tuple[Any, Dict[str, Any]]:
+    """Best-effort context compression for message-shaped LLM payloads."""
+    target_model = (model or "").strip() or getattr(settings, "primary_model", "")
+    if not target_model:
+        return payload, {}
+
+    try:
+        if isinstance(payload, list) and all(isinstance(msg, BaseMessage) for msg in payload):
+            truncated, meta = _compress_message_list(payload, target_model, payload_label="messages")
+            return truncated, meta
+
+        if isinstance(payload, dict):
+            messages = payload.get("messages")
+            if isinstance(messages, list) and all(isinstance(msg, BaseMessage) for msg in messages):
+                truncated, meta = _compress_message_list(
+                    messages,
+                    target_model,
+                    payload_label="payload.messages",
+                )
+                updated = dict(payload)
+                updated["messages"] = truncated
+                return updated, meta
+    except Exception as exc:
+        logger.warning("Context compression skipped for model=%s: %s", target_model, exc)
+
+    return payload, {}
+
+
+def _compress_message_list(
+    messages: List[BaseMessage],
+    target_model: str,
+    *,
+    payload_label: str,
+) -> tuple[List[BaseMessage], Dict[str, Any]]:
+    manager = get_context_manager(target_model)
+    before_stats = manager.count_messages_tokens(messages)
+    truncated = truncate_for_model(messages, model=target_model)
+    after_stats = manager.count_messages_tokens(truncated)
+    removed_count = len(messages) - len(truncated)
+
+    meta: Dict[str, Any] = {
+        "compression_checked": True,
+        "compression_model": target_model,
+        "compression_payload": payload_label,
+        "compression_strategy": manager.config.strategy,
+        "compression_max_tokens": manager.max_context_tokens,
+        "compression_before_messages": len(messages),
+        "compression_after_messages": len(truncated),
+        "compression_removed_messages": max(0, removed_count),
+        "compression_before_tokens": before_stats.total_tokens,
+        "compression_after_tokens": after_stats.total_tokens,
+        "compression_applied": removed_count > 0,
+    }
+
+    if removed_count > 0:
+        logger.info(
+            "[context_compression] %s %s -> %s messages, %s -> %s tokens, model=%s, strategy=%s",
+            payload_label,
+            len(messages),
+            len(truncated),
+            before_stats.total_tokens,
+            after_stats.total_tokens,
+            target_model,
+            manager.config.strategy,
+        )
+
+    return truncated, meta
 
 
 def initialize_enhanced_tools() -> None:
@@ -1747,13 +1836,16 @@ Return ONLY a JSON object:
         )
 
         try:
-            response = llm.invoke(
+            response = _invoke_llm_with_trace(
+                llm,
                 prompt.format_messages(
                     question=original_question,
                     feedback=feedback,
                     existing="\n".join(existing_plan),
                 ),
                 config=config,
+                span_name="refine_plan_llm",
+                model=_model_for_task("planning", config),
             )
             _log_usage(response, "refine_plan")
             logger.info(f"[timing] refine_plan LLM {(time.time() - t0):.3f}s")

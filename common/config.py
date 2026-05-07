@@ -298,6 +298,11 @@ class Settings(BaseSettings):
     rag_embedding_model: str = "text-embedding-3-small"  # Legacy embedding model fallback
     rag_chunk_size: int = 1000  # Document chunk size
     rag_chunk_overlap: int = 200  # Overlap between chunks
+    rag_chunk_strategy: str = "semantic"  # basic | semantic
+    rag_retrieval_mode: str = "hybrid"  # dense | hybrid
+    rag_hybrid_dense_weight: float = 0.65
+    rag_hybrid_keyword_weight: float = 0.35
+    rag_keyword_candidate_limit: int = 200
 
     # Tree-based Research Config
     tree_exploration_enabled: bool = True  # Enable tree-based deep research

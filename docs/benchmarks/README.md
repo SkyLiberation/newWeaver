@@ -3,8 +3,10 @@
 ## Files
 
 - `eval/benchmarks/sample_tasks.jsonl`: sample benchmark inputs
+- `eval/benchmarks/rag_sample_tasks.jsonl`: sample RAG benchmark inputs
 - `eval/golden_queries.json`: lightweight golden baseline cases
 - `scripts/benchmark_deep_research.py`: regression smoke runner
+- `scripts/benchmark_rag.py`: lightweight RAG retrieval + answer benchmark runner
 
 ## Run Smoke Benchmark
 
@@ -89,3 +91,32 @@ The runner writes a JSON report containing:
   - default quality gate values used in this run
 
 Use this as a reproducible smoke signal in CI/nightly workflows.
+
+## Run RAG Benchmark
+
+Use this when you want to measure local knowledge-base quality instead of web deep-research quality.
+
+```bash
+.venv/bin/python scripts/benchmark_rag.py \
+  --bench-file eval/benchmarks/rag_sample_tasks.jsonl \
+  --output /tmp/rag-bench.json
+```
+
+Suggested JSONL fields per case:
+
+```json
+{
+  "id": "rag_001",
+  "query": "What environment variable configures the API base URL?",
+  "expected_sources": ["config.md"],
+  "expected_context_keywords": ["API_BASE_URL"],
+  "expected_answer_keywords": ["API_BASE_URL"],
+  "min_answer_recall": 1.0
+}
+```
+
+Notes:
+- `expected_sources`: expected filenames or source substrings that should appear in retrieved chunks
+- `expected_context_keywords`: evidence terms that should appear in retrieved content
+- `expected_answer_keywords`: answer terms expected in the final response
+- `should_abstain=true`: use for unanswerable questions; the benchmark checks whether the system refuses cleanly

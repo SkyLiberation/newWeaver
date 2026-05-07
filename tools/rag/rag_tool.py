@@ -33,8 +33,13 @@ class RAGTool:
         embedding_model: str = "text-embedding-3-small",
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
+        chunk_strategy: str = "semantic",
         http_endpoint: Optional[str] = None,
         http_headers: Optional[Dict[str, str]] = None,
+        retrieval_mode: str = "hybrid",
+        hybrid_dense_weight: float = 0.65,
+        hybrid_keyword_weight: float = 0.35,
+        keyword_candidate_limit: int = 200,
     ):
         """
         Initialize the RAG tool.
@@ -45,12 +50,18 @@ class RAGTool:
             embedding_model: OpenAI embedding model name
             chunk_size: Document chunk size
             chunk_overlap: Chunk overlap for context
+            chunk_strategy: Chunking strategy for document splitting
             http_endpoint: Optional Chroma HTTP endpoint
             http_headers: Optional headers for Chroma HTTP auth
+            retrieval_mode: Retrieval mode ("dense" or "hybrid")
+            hybrid_dense_weight: Weight for dense vector scores in hybrid mode
+            hybrid_keyword_weight: Weight for keyword scores in hybrid mode
+            keyword_candidate_limit: Max documents scanned for keyword retrieval
         """
         self.loader = DocumentLoader(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            chunk_strategy=chunk_strategy,
         )
         self.embedder = Embedder(model=embedding_model)
         self.vector_store = VectorStore(
@@ -59,6 +70,10 @@ class RAGTool:
             http_endpoint=http_endpoint,
             http_headers=http_headers,
             embedding_function=self.embedder,
+            retrieval_mode=retrieval_mode,
+            hybrid_dense_weight=hybrid_dense_weight,
+            hybrid_keyword_weight=hybrid_keyword_weight,
+            keyword_candidate_limit=keyword_candidate_limit,
         )
 
     def add_document(
@@ -217,8 +232,13 @@ def get_rag_tool(*, collection_name: Optional[str] = None) -> Optional[RAGTool]:
             ),
             chunk_size=getattr(settings, "rag_chunk_size", 1000),
             chunk_overlap=getattr(settings, "rag_chunk_overlap", 200),
+            chunk_strategy=getattr(settings, "rag_chunk_strategy", "semantic"),
             http_endpoint=getattr(settings, "rag_chroma_endpoint", None),
             http_headers={chroma_header: chroma_key} if chroma_header and chroma_key else None,
+            retrieval_mode=getattr(settings, "rag_retrieval_mode", "hybrid"),
+            hybrid_dense_weight=getattr(settings, "rag_hybrid_dense_weight", 0.65),
+            hybrid_keyword_weight=getattr(settings, "rag_hybrid_keyword_weight", 0.35),
+            keyword_candidate_limit=getattr(settings, "rag_keyword_candidate_limit", 200),
         )
         _RAG_BY_COLLECTION[resolved_collection] = rag
         return rag
